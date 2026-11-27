@@ -1,6 +1,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, LogOut, Phone, UserPlus, X } from 'lucide-react';
+import { AlertCircle, LogOut, Phone } from 'lucide-react';
+import AdminPanel, { AdminLogin } from './admin/AdminPanel.jsx';
 import SignSpeakFlowers from './SignSpeakFlowers.jsx';
+import SignSpeakLoginBackground from './SignSpeakLoginBackground.jsx';
 import './SignSpeakLogin.css';
 
 const AccountContext = createContext(null);
@@ -106,14 +108,26 @@ export default function AccountShell({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState('');
+  const [authNotice, setAuthNotice] = useState('');
+  const [adminLoginError, setAdminLoginError] = useState('');
+  const [adminLoginBusy, setAdminLoginBusy] = useState(false);
   const [providerNotice, setProviderNotice] = useState('');
-  const [authMode, setAuthMode] = useState('login');
+  const [passwordResetToken, setPasswordResetToken] = useState(
+    () => new URLSearchParams(window.location.search).get('reset') || ''
+  );
+  const [passwordResetUrl, setPasswordResetUrl] = useState('');
+  const [authMode, setAuthMode] = useState(
+    () => new URLSearchParams(window.location.search).has('reset') ? 'password-reset' : 'login'
+  );
   const [verificationUrl, setVerificationUrl] = useState('');
-  const [verificationEmail, setVerificationEmail] = useState('');
   const [googleClientId, setGoogleClientId] = useState(null);
   const [facebookAppId, setFacebookAppId] = useState(null);
   const [contacts, setContacts] = useState([]);
+  const [callingEnabled, setCallingEnabled] = useState(false);
   const [calls, setCalls] = useState([]);
+  const [notificationPermission, setNotificationPermission] = useState(
+    () => ('Notification' in window ? window.Notification.permission : 'unsupported')
+  );
   const [showContacts, setShowContacts] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -125,6 +139,24 @@ export default function AccountShell({ children }) {
   const signalListenersRef = useRef(new Set());
   const verificationStartedRef = useRef(false);
   const googleButtonRef = useRef(null);
+  const appAccessRecordedRef = useRef(null);
+
+  const trackActivity = useCallback((action) => apiRequest('/api/activity', {
+    method: 'POST',
+    body: JSON.stringify({ action })
+  }), []);
+
+  useEffect(() => {
+    if (!user) {
+      appAccessRecordedRef.current = null;
+      return;
+    }
+    if (appAccessRecordedRef.current === user.id) return;
+    appAccessRecordedRef.current = user.id;
+    trackActivity('app_access').catch((error) => {
+      console.error('Unable to record SignSpeak access:', error);
+    });
+  }, [user?.id, trackActivity]);
 
   const handleFacebookAccessToken = useCallback(async (accessToken) => {
     setAuthError('');
@@ -248,6 +280,7 @@ export default function AccountShell({ children }) {
   const loadContacts = useCallback(async () => {
     const result = await apiRequest('/api/contacts');
     setContacts(result.contacts);
+    setCallingEnabled(result.callingEnabled);
   }, []);
 
   const loadCalls = useCallback(async () => {
@@ -255,32 +288,33 @@ export default function AccountShell({ children }) {
     setCalls(result.calls);
   }, []);
 
-  const resendVerification = async () => {
-    setAuthError('');
-    setVerificationUrl('');
-    try {
-      const result = await apiRequest('/api/auth/verification/resend', {
-        method: 'POST',
-        body: JSON.stringify({ email: verificationEmail })
-      });
-      setAuthError(result.message);
-      setVerificationUrl(result.developmentVerificationUrl || '');
-    } catch (error) {
-      setAuthError(error.message);
+  const enableCallNotifications = useCallback(async () => {
+    if (!('Notification' in window)) {
+      setNotificationPermission('unsupported');
+      return;
     }
-  };
+    const permission = await window.Notification.requestPermission();
+    setNotificationPermission(permission);
+  }, []);
 
   useEffect(() => {
     const query = new URLSearchParams(window.location.search);
+    const resetToken = query.get('reset');
+    if (resetToken) {
+      setPasswordResetToken(resetToken);
+      setAuthMode('password-reset');
+      setLoading(false);
+      return;
+    }
+
     const verificationToken = query.get('verify');
     if (verificationToken) {
       if (verificationStartedRef.current) return undefined;
       verificationStartedRef.current = true;
       apiRequest(`/api/auth/verify?token=${encodeURIComponent(verificationToken)}`)
         .then((result) => {
-          setAuthError(result.message);
+          setAuthNotice(result.message);
           setAuthMode('login');
-          setVerificationEmail('');
           if (result.user) setUser(result.user);
           window.history.replaceState({}, '', window.location.pathname);
         })
@@ -322,6 +356,22 @@ export default function AccountShell({ children }) {
           setAuthError('The call service sent an invalid message.');
           return;
         }
+        if (
+          message.type === 'call:incoming'
+          && document.visibilityState === 'hidden'
+          && 'Notification' in window
+          && window.Notification.permission === 'granted'
+        ) {
+          try {
+            new window.Notification(`Incoming call from ${message.caller?.displayName || 'a SignSpeak contact'}`, {
+              body: 'Open SignSpeak to answer the call.',
+              icon: message.caller?.profileImageUrl || '/signspeak-icon.svg',
+              tag: `signspeak-call-${message.callId}`
+            });
+          } catch (error) {
+            console.error('Unable to show an incoming call notification:', error);
+          }
+        }
         handleSignalingMessage(message, setCurrentCall, loadContacts, loadCalls);
         if (message.type === 'error') setAuthError(message.message);
         for (const listener of signalListenersRef.current) listener(message);
@@ -344,6 +394,14 @@ export default function AccountShell({ children }) {
       setSocketStatus('offline');
     };
   }, [user?.id, loadCalls, loadContacts]);
+
+  useEffect(() => {
+    if (!user || !showContacts) return undefined;
+    const refreshTimer = window.setInterval(() => {
+      loadContacts().catch((error) => setAuthError(error.message));
+    }, 15_000);
+    return () => window.clearInterval(refreshTimer);
+  }, [user?.id, showContacts, loadContacts]);
 
   const sendSignal = useCallback((type, payload = {}) => {
     const socket = socketRef.current;
@@ -383,13 +441,50 @@ export default function AccountShell({ children }) {
   const submitAuth = async (event) => {
     event.preventDefault();
     setAuthError('');
+    setAuthNotice('');
     setProviderNotice('');
     setVerificationUrl('');
-    setVerificationEmail('');
+    setPasswordResetUrl('');
     const data = new FormData(event.currentTarget);
+    if (authMode === 'password-reset') {
+      const password = String(data.get('password') || '');
+      if (password !== data.get('confirmPassword')) {
+        setAuthError('The passwords do not match.');
+        return;
+      }
+      try {
+        const result = await apiRequest('/api/auth/password-reset/complete', {
+          method: 'POST',
+          body: JSON.stringify({ token: passwordResetToken, password })
+        });
+        setAuthNotice(result.message);
+        setPasswordResetToken('');
+        setAuthMode('login');
+        window.history.replaceState({}, '', window.location.pathname);
+      } catch (error) {
+        setAuthError(error.message);
+      }
+      return;
+    }
+    if (authMode === 'password-reset-request') {
+      try {
+        const result = await apiRequest('/api/auth/password-reset/request', {
+          method: 'POST',
+          body: JSON.stringify({ email: data.get('email') })
+        });
+        setAuthNotice(result.message);
+        setPasswordResetUrl(result.developmentResetUrl || '');
+      } catch (error) {
+        setAuthError(error.message);
+      }
+      return;
+    }
+
     const payload = {
       displayName: data.get('displayName'),
+      username: data.get('username'),
       email: data.get('email'),
+      identifier: data.get('identifier'),
       password: data.get('password')
     };
     try {
@@ -398,22 +493,44 @@ export default function AccountShell({ children }) {
           method: 'POST',
           body: JSON.stringify(payload)
         });
-        setAuthError(result.message);
+        setAuthNotice(result.message);
         setVerificationUrl(result.developmentVerificationUrl || '');
-        setVerificationEmail(String(payload.email).trim().toLowerCase());
         setAuthMode('login');
       } else {
         const result = await apiRequest('/api/auth/login', {
           method: 'POST',
-          body: JSON.stringify({ email: payload.email, password: payload.password })
+          body: JSON.stringify({ identifier: payload.identifier, password: payload.password })
         });
         setUser(result.user);
       }
     } catch (error) {
       setAuthError(error.message);
-      if (authMode === 'login' && error.message === 'Verify your email before signing in.') {
-        setVerificationEmail(String(payload.email).trim().toLowerCase());
+    }
+  };
+
+  const submitAdminLogin = async (event) => {
+    event.preventDefault();
+    setAdminLoginError('');
+    setAdminLoginBusy(true);
+    const data = new FormData(event.currentTarget);
+    try {
+      const result = await apiRequest('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({
+          identifier: data.get('email'),
+          password: data.get('password')
+        })
+      });
+      if (!['admin', 'super_admin'].includes(result.user.role)) {
+        await apiRequest('/api/auth/logout', { method: 'POST' });
+        setAdminLoginError('This account does not have administrator access.');
+        return;
       }
+      setUser(result.user);
+    } catch (error) {
+      setAdminLoginError(error.message);
+    } finally {
+      setAdminLoginBusy(false);
     }
   };
 
@@ -426,15 +543,17 @@ export default function AccountShell({ children }) {
       setAuthError('');
       setProviderNotice('');
       setVerificationUrl('');
-      setVerificationEmail('');
+      return true;
     } catch (error) {
       setAuthError(error.message);
+      return false;
     }
   };
 
   const contextValue = useMemo(() => ({
     user,
     currentCall,
+    callingEnabled,
     socketStatus,
     localVideoStream,
     setLocalVideoStream,
@@ -444,17 +563,32 @@ export default function AccountShell({ children }) {
     declineCall,
     endCall,
     subscribeSignals,
-    apiRequest
+    apiRequest,
+    trackActivity,
+    notificationPermission,
+    enableCallNotifications
   }), [
-    user, currentCall, socketStatus, localVideoStream, sendSignal, startCall,
-    acceptCall, declineCall, endCall, subscribeSignals
+    user, currentCall, callingEnabled, socketStatus, localVideoStream, sendSignal, startCall,
+    acceptCall, declineCall, endCall, subscribeSignals, trackActivity,
+    notificationPermission, enableCallNotifications
   ]);
+
+  const isAdminRoute = window.location.pathname === '/admin' || window.location.pathname.startsWith('/admin/');
 
   if (loading) {
     return <main className="min-h-screen grid place-items-center bg-slate-950 text-cyan-200">Connecting to SignSpeak…</main>;
   }
 
   if (!user) {
+    if (isAdminRoute) {
+      return (
+        <AdminLogin
+          onSubmit={submitAdminLogin}
+          error={adminLoginError}
+          busy={adminLoginBusy}
+        />
+      );
+    }
     return (
       <main className="auth-screen">
         <div className="auth-page">
@@ -462,17 +596,7 @@ export default function AccountShell({ children }) {
             <span>SignSpeak</span>
           </aside>
 
-          <div className="login-background-circle login-circle-a" aria-hidden="true" />
-          <div className="login-background-circle login-circle-b" aria-hidden="true" />
-          <div className="login-background-circle login-circle-c" aria-hidden="true" />
-
-          {Array.from({ length: 12 }, (_, index) => (
-            <span
-              key={index}
-              className={`login-dot login-dot-${index + 1}`}
-              aria-hidden="true"
-            />
-          ))}
+          <SignSpeakLoginBackground />
 
           <form
             onSubmit={submitAuth}
@@ -480,8 +604,27 @@ export default function AccountShell({ children }) {
             className={`login-card${authMode === 'register' ? ' login-card--register' : ''}`}
           >
             <h1 id="auth-heading" className="login-title">
-              {authMode === 'register' ? 'Create Account' : 'Login Now'}
+              {authMode === 'register' ? 'Create Account'
+                : authMode === 'password-reset' ? 'Reset Password'
+                  : authMode === 'password-reset-request' ? 'Forgot Password'
+                    : 'Login Now'}
             </h1>
+
+            {authMode === 'register' && (
+              <input
+                className="login-field"
+                name="username"
+                type="text"
+                placeholder="Username"
+                aria-label="Username"
+                autoComplete="username"
+                minLength={3}
+                maxLength={32}
+                pattern="[A-Za-z0-9._-]{3,32}"
+                title="Use 3 to 32 letters, numbers, dots, underscores, or hyphens."
+                required
+              />
+            )}
 
             {authMode === 'register' && (
               <input
@@ -497,34 +640,51 @@ export default function AccountShell({ children }) {
               />
             )}
 
-            <input
-              className="login-field"
-              name="email"
-              type="email"
-              placeholder="Email address"
-              aria-label="Email address"
-              autoComplete="email"
-              maxLength={254}
-              onChange={(event) => {
-                const enteredEmail = event.currentTarget.value.trim().toLowerCase();
-                setVerificationEmail((currentEmail) => (
-                  currentEmail && currentEmail !== enteredEmail ? '' : currentEmail
-                ));
-              }}
-              required
-            />
+            {authMode !== 'password-reset' && (
+              <input
+                className="login-field"
+                name={authMode === 'login' ? 'identifier' : 'email'}
+                type={authMode === 'login' ? 'text' : 'email'}
+                placeholder={authMode === 'login' ? 'Email or username' : 'Email address'}
+                aria-label={authMode === 'login' ? 'Email or username' : 'Email address'}
+                autoComplete={authMode === 'login' ? 'username' : 'email'}
+                maxLength={254}
+                onChange={(event) => {
+                  const enteredIdentifier = event.currentTarget.value.trim().toLowerCase();
+                  setVerificationIdentifier((currentIdentifier) => (
+                    currentIdentifier && currentIdentifier !== enteredIdentifier ? '' : currentIdentifier
+                  ));
+                }}
+                required
+              />
+            )}
 
-            <input
-              className="login-field"
-              name="password"
-              type="password"
-              placeholder="Password"
-              aria-label="Password"
-              autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
-              minLength={authMode === 'register' ? 6 : undefined}
-              maxLength={128}
-              required
-            />
+            {(authMode === 'login' || authMode === 'register' || authMode === 'password-reset') && (
+              <input
+                className="login-field"
+                name="password"
+                type="password"
+                placeholder={authMode === 'password-reset' ? 'New password' : 'Password'}
+                aria-label={authMode === 'password-reset' ? 'New password' : 'Password'}
+                autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+                minLength={authMode === 'login' ? undefined : 6}
+                maxLength={128}
+                required
+              />
+            )}
+            {authMode === 'password-reset' && (
+              <input
+                className="login-field"
+                name="confirmPassword"
+                type="password"
+                placeholder="Confirm new password"
+                aria-label="Confirm new password"
+                autoComplete="new-password"
+                minLength={6}
+                maxLength={128}
+                required
+              />
+            )}
             {authMode === 'register' && (
               <span className="login-password-hint">
                 Use at least 6 characters: letters, digits, or both (up to 128).
@@ -536,24 +696,41 @@ export default function AccountShell({ children }) {
                 {authError}
               </p>
             )}
-            {verificationEmail && authMode === 'login' && (
-              <button
-                className="login-resend-verification"
-                type="button"
-                onClick={resendVerification}
-              >
-                Resend verification link
-              </button>
+            {authNotice && (
+              <p role="status" aria-live="polite" className="login-notice">
+                {authNotice}
+              </p>
             )}
             {verificationUrl && (
               <a className="login-verification-link" href={verificationUrl}>
-                Open verification link (development)
+                Optional: verify email (not required to sign in)
+              </a>
+            )}
+            {passwordResetUrl && authMode === 'password-reset-request' && (
+              <a className="login-verification-link" href={passwordResetUrl}>
+                Open password reset link (development)
               </a>
             )}
 
             <button className="login-btn" type="submit">
-              {authMode === 'register' ? 'SIGN UP' : 'LOGIN'}
+              {authMode === 'register' ? 'SIGN UP'
+                : authMode === 'password-reset' ? 'UPDATE PASSWORD'
+                  : authMode === 'password-reset-request' ? 'SEND RESET LINK'
+                    : 'LOGIN'}
             </button>
+
+            {authMode === 'login' && (
+              <button
+                className="login-resend-verification"
+                type="button"
+                onClick={() => {
+                  setAuthError('');
+                  setAuthMode('password-reset-request');
+                }}
+              >
+                Forgot password?
+              </button>
+            )}
 
             {authMode === 'login' && (
               <>
@@ -593,7 +770,9 @@ export default function AccountShell({ children }) {
             )}
 
             <div className="login-member">
-              {authMode === 'login' ? 'Not a member?' : 'Already have an account?'}{' '}
+              {authMode === 'login' ? 'Not a member?'
+                : authMode === 'register' ? 'Already have an account?'
+                  : 'Return to your account?'}{' '}
               <button
                 type="button"
                 onClick={() => {
@@ -614,6 +793,32 @@ export default function AccountShell({ children }) {
     );
   }
 
+  if (isAdminRoute) {
+    if (!['admin', 'super_admin'].includes(user.role)) {
+      return (
+        <main className="grid min-h-screen place-items-center bg-slate-950 p-6 text-slate-100">
+          <section className="max-w-lg rounded-2xl border border-slate-800 bg-slate-900 p-8 text-center">
+            <h1 className="text-2xl font-bold">Administrator access required</h1>
+            <p className="mt-3 text-slate-400">This account does not have permission to open the Admin Panel.</p>
+            <a href="/" className="mt-6 inline-flex rounded-lg bg-cyan-700 px-4 py-2 font-semibold hover:bg-cyan-600">
+              Return to SignSpeak
+            </a>
+          </section>
+        </main>
+      );
+    }
+    return (
+      <AdminPanel
+        user={user}
+        apiRequest={apiRequest}
+        onProfileUpdated={setUser}
+        onLogout={async () => {
+          if (await logout()) window.location.assign('/');
+        }}
+      />
+    );
+  }
+
   return (
     <AccountContext.Provider value={contextValue}>
       <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -623,6 +828,11 @@ export default function AccountShell({ children }) {
             <p className="truncate text-xs text-slate-500">{user.email} · {socketStatus}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            {['admin', 'super_admin'].includes(user.role) && (
+              <a href="/admin" className="rounded-lg border border-cyan-800 px-3 py-2 text-sm text-cyan-200 hover:border-cyan-500">
+                Admin Panel
+              </a>
+            )}
             <button type="button" onClick={() => {
               const nextVisible = !showContacts;
               setShowContacts(nextVisible);
@@ -651,94 +861,80 @@ export default function AccountShell({ children }) {
 
         {showContacts && (
           <section aria-label="Contacts" className="mx-auto my-3 max-w-5xl rounded-xl border border-slate-800 bg-slate-900 p-4">
-            <form
-              className="flex flex-wrap gap-2"
-              onSubmit={async (event) => {
-                event.preventDefault();
-                setAuthError('');
-                const form = event.currentTarget;
-                try {
-                  await apiRequest('/api/contacts', {
-                    method: 'POST',
-                    body: JSON.stringify({ email: new FormData(form).get('contactEmail') })
-                  });
-                  form.reset();
-                  await loadContacts();
-                } catch (error) {
-                  setAuthError(error.message);
-                }
-              }}
-            >
-              <label className="sr-only" htmlFor="contact-email">Verified contact email</label>
-              <input id="contact-email" name="contactEmail" required type="email" placeholder="Verified SignSpeak account email" className="min-w-64 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-              <button type="submit" className="flex items-center gap-2 rounded-lg bg-cyan-700 px-4 py-2 font-semibold hover:bg-cyan-600">
-                <UserPlus className="h-4 w-4" /> Invite contact
-              </button>
-            </form>
+            <header className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-bold">Super Admin-approved contacts</h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  Only accounts with an approved, verified phone and enabled calling permission appear here.
+                </p>
+              </div>
+              {notificationPermission === 'default' && (
+                <button
+                  type="button"
+                  onClick={() => enableCallNotifications().catch((error) => setAuthError(error.message))}
+                  className="rounded-lg border border-cyan-800 px-3 py-2 text-sm text-cyan-200 hover:border-cyan-500"
+                >
+                  Enable call notifications
+                </button>
+              )}
+            </header>
+            {notificationPermission === 'unsupported' && (
+              <p className="mt-3 text-xs text-amber-200">
+                This browser does not support call notifications. Keep SignSpeak open to receive in-app calls.
+              </p>
+            )}
+            {notificationPermission === 'denied' && (
+              <p className="mt-3 text-xs text-amber-200">
+                Browser notifications are blocked. Allow them in browser settings; SignSpeak must remain open for in-app calls.
+              </p>
+            )}
+            {notificationPermission === 'granted' && (
+              <p className="mt-3 text-xs text-slate-400">
+                Browser notifications are enabled while this browser is running. Background push when SignSpeak is closed is not configured.
+              </p>
+            )}
+            {!callingEnabled && (
+              <p className="mt-3 rounded-lg border border-amber-800 bg-amber-950/30 p-3 text-sm text-amber-200">
+                Calling is disabled for this account until a Super Admin approves a verified phone and enables calling.
+              </p>
+            )}
             <ul className="mt-3 divide-y divide-slate-800">
               {contacts.map((contact) => (
                 <li key={contact.id} className="flex flex-wrap items-center justify-between gap-2 py-3">
                   <div>
                     <p className="font-semibold">{contact.display_name}</p>
-                    <p className="text-xs text-slate-500">{contact.email} · {contact.direction} · {contact.status}</p>
+                    <p className="text-xs text-slate-500">{contact.email}</p>
+                    <p className={`mt-1 text-xs ${contact.online ? 'text-emerald-300' : 'text-slate-500'}`}>
+                      {contact.online ? 'Online' : 'Offline'}
+                    </p>
                   </div>
                   <div className="flex gap-2">
-                    {contact.status === 'accepted' && (
-                      <>
-                      <button type="button" onClick={() => {
-                        try {
-                          startCall(contact, 'deaf-to-deaf');
-                        } catch (error) {
-                          setAuthError(error.message);
-                        }
-                      }} className="flex items-center gap-1 rounded-lg border border-cyan-700 px-3 py-1.5 text-sm text-cyan-200 hover:bg-cyan-950">
-                        <Phone className="h-4 w-4" /> Sign call
-                      </button>
-                      <button type="button" onClick={() => {
-                        try {
-                          startCall(contact, 'deaf-to-hearing');
-                        } catch (error) {
-                          setAuthError(error.message);
-                        }
-                      }} className="rounded-lg border border-violet-700 px-3 py-1.5 text-sm text-violet-200 hover:bg-violet-950">
-                        Sign + speech
-                      </button>
-                      </>
-                    )}
-                    {contact.status === 'pending' && contact.direction === 'incoming' && (
-                      <>
-                      <button type="button" onClick={async () => {
-                        try {
-                          await apiRequest(`/api/contacts/${contact.id}/accept`, { method: 'POST' });
-                          await loadContacts();
-                        } catch (error) {
-                          setAuthError(error.message);
-                        }
-                      }} className="rounded-lg border border-emerald-700 px-3 py-1.5 text-sm text-emerald-200">Accept</button>
-                      <button type="button" onClick={async () => {
-                        try {
-                          await apiRequest(`/api/contacts/${contact.id}/decline`, { method: 'POST' });
-                          await loadContacts();
-                        } catch (error) {
-                          setAuthError(error.message);
-                        }
-                      }} className="rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-300">Decline</button>
-                      </>
-                    )}
-                    <button type="button" aria-label={`Remove ${contact.display_name}`} onClick={async () => {
+                    <button type="button" onClick={() => {
                       try {
-                        await apiRequest(`/api/contacts/${contact.id}`, { method: 'DELETE' });
-                        await loadContacts();
+                        startCall(contact, 'deaf-to-deaf');
                       } catch (error) {
                         setAuthError(error.message);
                       }
-                    }} className="rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:text-red-300">
-                      <X className="h-4 w-4" />
+                    }} className="flex items-center gap-1 rounded-lg border border-cyan-700 px-3 py-1.5 text-sm text-cyan-200 hover:bg-cyan-950">
+                      <Phone className="h-4 w-4" /> Sign call
+                    </button>
+                    <button type="button" onClick={() => {
+                      try {
+                        startCall(contact, 'deaf-to-hearing');
+                      } catch (error) {
+                        setAuthError(error.message);
+                      }
+                    }} className="rounded-lg border border-violet-700 px-3 py-1.5 text-sm text-violet-200 hover:bg-violet-950">
+                      Sign + speech
                     </button>
                   </div>
                 </li>
               ))}
-              {contacts.length === 0 && <li className="py-4 text-sm text-slate-500">No contacts yet. Invite another verified account.</li>}
+              {contacts.length === 0 && (
+                <li className="py-4 text-sm text-slate-500">
+                  {callingEnabled ? 'No other Super Admin-approved accounts are available.' : 'No approved calling contacts are available.'}
+                </li>
+              )}
             </ul>
           </section>
         )}
@@ -748,10 +944,13 @@ export default function AccountShell({ children }) {
             <form className="space-y-3" onSubmit={async (event) => {
               event.preventDefault();
               try {
-                const displayName = new FormData(event.currentTarget).get('displayName');
+                const formData = new FormData(event.currentTarget);
                 const result = await apiRequest('/api/profile', {
                   method: 'PATCH',
-                  body: JSON.stringify({ displayName })
+                  body: JSON.stringify({
+                    displayName: formData.get('displayName'),
+                    profileImageUrl: formData.get('profileImageUrl')
+                  })
                 });
                 setUser(result.user);
               } catch (error) {
@@ -762,6 +961,10 @@ export default function AccountShell({ children }) {
               <label className="block text-sm text-slate-300">
                 Display name
                 <input name="displayName" required minLength={2} maxLength={80} defaultValue={user.displayName} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+              </label>
+              <label className="block text-sm text-slate-300">
+                Profile image URL (HTTPS)
+                <input name="profileImageUrl" type="url" maxLength={2048} defaultValue={user.profileImageUrl || ''} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
               </label>
               <p className="text-sm text-slate-500">{user.email} · email verified</p>
               <button type="submit" className="rounded-lg bg-cyan-700 px-4 py-2 font-semibold">Save profile</button>
@@ -885,6 +1088,9 @@ function CallPanel() {
         const { iceServers } = await apiRequest('/api/calls/ice-config');
         if (disposed) return;
         setIceConfig(iceServers);
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Camera and microphone access requires HTTPS on this device.');
+        }
         audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
         if (disposed) {
           audioStream.getTracks().forEach((track) => track.stop());
@@ -1083,7 +1289,10 @@ function CallPanel() {
         <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
           <div>
             <h2 id="call-title" className="text-xl font-bold">Call with {call.peer?.displayName || call.peer?.display_name || 'SignSpeak contact'}</h2>
-            <p role="status" aria-live="polite" className="text-sm text-cyan-300">{call.status} · {call.mode === 'deaf-to-hearing' ? 'Deaf-to-hearing' : 'Deaf-to-deaf'}</p>
+            <p role="status" aria-live="polite" className="text-sm text-cyan-300">
+              {call.status === 'missed' ? 'Contact is offline or unavailable' : call.status}
+              {' · '}{call.mode === 'deaf-to-hearing' ? 'Deaf-to-hearing' : 'Deaf-to-deaf'}
+            </p>
           </div>
           <button type="button" onClick={() => {
             try {
@@ -1096,6 +1305,13 @@ function CallPanel() {
 
         {isIncoming && (
           <div className="flex flex-wrap items-center gap-3 rounded-xl border border-cyan-700 bg-cyan-950/50 p-4">
+            {call.peer?.profileImageUrl && (
+              <img
+                src={call.peer.profileImageUrl}
+                alt=""
+                className="h-12 w-12 rounded-full object-cover"
+              />
+            )}
             <p className="flex-1">{call.peer?.displayName || 'Your contact'} is calling.</p>
             <button type="button" onClick={() => {
               try {
@@ -1208,7 +1424,9 @@ function CallPanel() {
 }
 
 function handleSignalingMessage(message, setCurrentCall, loadContacts, loadCalls) {
-  if (message.type === 'call:incoming') {
+  if (message.type === 'call:claimed') {
+    setCurrentCall((current) => current?.callId === message.callId ? null : current);
+  } else if (message.type === 'call:incoming') {
     setCurrentCall({ callId: message.callId, role: 'callee', status: 'ringing', mode: message.mode, peer: message.caller });
   } else if (message.type === 'call:outgoing') {
     setCurrentCall({ callId: message.callId, role: 'caller', status: message.status, mode: message.mode });

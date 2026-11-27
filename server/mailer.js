@@ -38,6 +38,26 @@ export async function sendVerificationEmail({ email, displayName, verificationUr
   return {};
 }
 
+export async function sendPasswordResetEmail({ email, displayName, resetUrl }) {
+  const mailTransport = getTransport();
+  if (!mailTransport) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('Password reset email is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, and SMTP_PASSWORD.');
+    }
+    return { developmentUrl: resetUrl };
+  }
+
+  await mailTransport.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: 'Reset your SignSpeak password',
+    text: `Hello ${displayName}, reset your SignSpeak password: ${resetUrl}`,
+    html: `<p>Hello ${escapeHtml(displayName)},</p><p><a href="${escapeHtml(resetUrl)}">Reset your SignSpeak password</a></p><p>This link expires in 30 minutes and can only be used once.</p>`
+  });
+
+  return {};
+}
+
 function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (character) => ({
     '&': '&amp;',

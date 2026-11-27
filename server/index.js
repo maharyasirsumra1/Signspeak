@@ -6,17 +6,27 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { db as defaultDatabase } from './db.js';
+import {
+  bootstrapSuperAdmin,
+  handleAdminRequest,
+  recordAuthEvent,
+  recordUserActivity
+} from './admin.js';
 import { verifyFacebookAccessToken } from './facebook-auth.js';
 import { verifyGoogleIdToken } from './google-auth.js';
 import { sendVerificationEmail } from './mailer.js';
+import { issuePasswordReset } from './password-reset.js';
 import { createToken, hashPassword, hashToken, verifyPassword } from './security.js';
+import { cleanProfileImageUrl } from './validation.js';
 
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const VERIFY_TTL_MS = 30 * 60 * 1000;
 const CALL_RING_TTL_MS = 45 * 1000;
 const MAX_BODY_BYTES = 16 * 1024;
+const TELEMETRY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const rateBuckets = new Map();
 const socketsByUser = new Map();
+let lastTelemetryPruneAt = 0;
 
 export function createSignSpeakServer({
   database = defaultDatabase,
@@ -28,6 +38,7 @@ export function createSignSpeakServer({
   facebookAppSecret = process.env.FACEBOOK_APP_SECRET || '',
   facebookTokenVerifier = verifyFacebookAccessToken
 } = {}) {
+  bootstrapSuperAdmin(database, process.env.SUPER_ADMIN_EMAIL);
   const isTls = Boolean(process.env.TLS_CERT_PATH && process.env.TLS_KEY_PATH);
   const server = isTls
     ? createHttpsServer({
@@ -59,6 +70,11 @@ export function createSignSpeakServer({
 
       webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
         webSocket.userId = user.id;
+        webSocket.sessionId = database.prepare(
+          'SELECT session_id FROM sessions WHERE token_hash = ?'
+        ).get(hashToken(getCookie(request, 'ss_session')))?.session_id;
+        webSocket.ipAddress = request.socket.remoteAddress || null;
+        webSocket.userAgent = request.headers['user-agent'] || null;
         webSocketServer.emit('connection', webSocket, request);
       });
     } catch (error) {
@@ -90,6 +106,7 @@ export function createSignSpeakServer({
     webSocket.on('close', () => {
       userSockets.delete(webSocket);
       if (userSockets.size === 0) socketsByUser.delete(webSocket.userId);
+      if (userSockets.size > 0) return;
       const calls = database.prepare(`
         SELECT id, caller_id, callee_id FROM calls
         WHERE status IN ('ringing', 'connecting', 'connected')
@@ -118,7 +135,13 @@ export function createSignSpeakServer({
       response,
       database,
       isTls,
-      { googleClientId, googleTokenVerifier, facebookAppId, facebookAppSecret, facebookTokenVerifier }
+      {
+        googleClientId,
+        googleTokenVerifier,
+        facebookAppId,
+        facebookAppSecret,
+        facebookTokenVerifier
+      }
     ).catch((error) => {
       if (!error.status || error.status >= 500) console.error('SignSpeak API error:', error);
       if (!response.headersSent) {
@@ -167,7 +190,11 @@ export function createSignSpeakServer({
 }
 
 async function routeRequest(request, response, database, isTls, providers) {
-  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  const forwardedProtocol = process.env.TRUST_PROXY === '1'
+    ? request.headers['x-forwarded-proto']?.split(',')[0]
+    : null;
+  const protocol = forwardedProtocol || (isTls ? 'https' : 'http');
+  const url = new URL(request.url, `${protocol}://${request.headers.host || 'localhost'}`);
   const { pathname } = url;
   const method = request.method || 'GET';
 
@@ -196,8 +223,18 @@ async function routeRequest(request, response, database, isTls, providers) {
     await resendVerification(request, response, database, url);
     return;
   }
+  if (method === 'POST' && pathname === '/api/auth/password-reset/request') {
+    enforceRateLimit(request, 'password-reset-request', 5);
+    await requestPasswordReset(request, response, database, url);
+    return;
+  }
   if (method === 'GET' && pathname === '/api/auth/verify') {
-    verifyEmail(response, database, url, isTls);
+    verifyEmail(request, response, database, url, isTls);
+    return;
+  }
+  if (method === 'POST' && pathname === '/api/auth/password-reset/complete') {
+    enforceRateLimit(request, 'password-reset-complete', 10);
+    await completePasswordReset(request, response, database, isTls);
     return;
   }
   if (method === 'POST' && pathname === '/api/auth/login') {
@@ -234,14 +271,57 @@ async function routeRequest(request, response, database, isTls, providers) {
   }
   if (method === 'POST' && pathname === '/api/auth/logout') {
     const sessionToken = getCookie(request, 'ss_session');
-    if (sessionToken) database.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(sessionToken));
+    if (sessionToken) {
+      const session = database.prepare(`
+        SELECT user_id, session_id FROM sessions
+        WHERE token_hash = ? AND revoked_at IS NULL
+      `).get(hashToken(sessionToken));
+      if (session) {
+        const now = Date.now();
+        recordAuthEvent(database, request, 'logout', { userId: session.user_id });
+        database.prepare('UPDATE sessions SET revoked_at = ? WHERE token_hash = ?')
+          .run(now, hashToken(sessionToken));
+        database.prepare('UPDATE users SET last_logout_at = ? WHERE id = ?').run(now, session.user_id);
+        closeUserSockets(session.user_id, session.session_id);
+      }
+    }
     clearSessionCookie(response, isTls);
     json(response, 200, { ok: true });
     return;
   }
 
+  if (pathname.startsWith('/api/admin/')) {
+    const adminUser = requireUser(request, response, database);
+    if (!adminUser) return;
+    if (method !== 'GET' && method !== 'HEAD') {
+      enforceRateLimit(request, 'admin-mutation', 60, adminUser.id);
+    }
+    const handled = await handleAdminRequest(
+      request,
+      response,
+      database,
+      adminUser,
+      url,
+      {
+        closeUserSockets,
+        getConnectionInfo,
+        terminateUserCalls: (userId) => terminateUserCalls(database, userId)
+      }
+    );
+    if (!handled) json(response, 404, { error: 'Route not found.' });
+    return;
+  }
+
   const user = requireUser(request, response, database);
   if (!user) return;
+
+  if (method === 'POST' && pathname === '/api/activity') {
+    enforceRateLimit(request, 'user-activity', 120, user.id);
+    const body = await readJson(request);
+    recordUserActivity(database, request, user.id, body.action);
+    json(response, 202, { ok: true });
+    return;
+  }
 
   if (method === 'GET' && pathname === '/api/profile') {
     json(response, 200, { user, settings: getSettings(database, user.id) });
@@ -251,7 +331,18 @@ async function routeRequest(request, response, database, isTls, providers) {
     const body = await readJson(request);
     const displayName = cleanText(body.displayName, 2, 80);
     if (!displayName) throw httpError(400, 'Display name must be between 2 and 80 characters.');
-    database.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName, user.id);
+    let profileImageUrl = user.profileImageUrl;
+    if (body.profileImageUrl !== undefined) {
+      try {
+        profileImageUrl = cleanProfileImageUrl(body.profileImageUrl);
+      } catch (error) {
+        throw httpError(400, error.message);
+      }
+    }
+    database.prepare(`
+      UPDATE users SET display_name = ?, profile_image_url = ? WHERE id = ?
+    `).run(displayName, profileImageUrl, user.id);
+    recordUserActivity(database, request, user.id, 'profile_updated');
     json(response, 200, { user: getPublicUser(database, user.id) });
     return;
   }
@@ -273,27 +364,22 @@ async function routeRequest(request, response, database, isTls, providers) {
     return;
   }
   if (method === 'GET' && pathname === '/api/contacts') {
-    json(response, 200, { contacts: listContacts(database, user.id) });
+    json(response, 200, {
+      contacts: listContacts(database, user.id),
+      callingEnabled: hasEnabledCallDevice(database, user.id)
+    });
     return;
   }
   if (method === 'POST' && pathname === '/api/contacts') {
-    enforceRateLimit(request, 'contact-invite', 20, user.id);
-    await createContactInvite(request, response, database, user);
-    return;
+    throw httpError(403, 'Calling contacts can only be approved by a Super Admin.');
   }
   const contactAction = pathname.match(/^\/api\/contacts\/([0-9a-f-]{36})\/(accept|decline)$/i);
   if (method === 'POST' && contactAction) {
-    respondToContactInvite(response, database, user.id, contactAction[1], contactAction[2]);
-    return;
+    throw httpError(403, 'Calling contacts can only be managed by a Super Admin.');
   }
   const contactDelete = pathname.match(/^\/api\/contacts\/([0-9a-f-]{36})$/i);
   if (method === 'DELETE' && contactDelete) {
-    const result = database.prepare(`
-      DELETE FROM contacts WHERE id = ? AND (requester_id = ? OR addressee_id = ?)
-    `).run(contactDelete[1], user.id, user.id);
-    if (!result.changes) throw httpError(404, 'Contact request not found.');
-    json(response, 200, { ok: true });
-    return;
+    throw httpError(403, 'Calling contacts can only be managed by a Super Admin.');
   }
   if (method === 'GET' && pathname === '/api/calls') {
     const calls = database.prepare(`
@@ -340,6 +426,8 @@ async function routeRequest(request, response, database, isTls, providers) {
     if (!await verifyPassword(body.password || '', row.password_hash)) {
       throw httpError(401, 'Password confirmation failed.');
     }
+    recordAuthEvent(database, request, 'account_deleted', { userId: user.id, email: user.email });
+    recordUserActivity(database, request, user.id, 'account_deleted');
     database.prepare('DELETE FROM users WHERE id = ?').run(user.id);
     clearSessionCookie(response, isTls);
     json(response, 200, { ok: true });
@@ -352,11 +440,15 @@ async function routeRequest(request, response, database, isTls, providers) {
 async function register(request, response, database, requestUrl) {
   const body = await readJson(request);
   const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const requestedUsername = typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
   const displayName = cleanText(body.displayName, 2, 80);
   const password = typeof body.password === 'string' ? body.password : '';
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
     throw httpError(400, 'Enter a valid email address.');
+  }
+  if (body.username !== undefined && !/^[a-z0-9._-]{3,32}$/.test(requestedUsername)) {
+    throw httpError(400, 'Username must be 3 to 32 characters and contain only letters, numbers, dots, underscores, or hyphens.');
   }
   if (!displayName) throw httpError(400, 'Display name must be between 2 and 80 characters.');
   if (password.length < 6 || password.length > 128) {
@@ -367,19 +459,31 @@ async function register(request, response, database, requestUrl) {
   }
 
   const userId = randomUUID();
+  const username = requestedUsername || makeAvailableUsername(database, email.split('@')[0], userId);
+  if (database.prepare('SELECT id FROM users WHERE username = ?').get(username)) {
+    throw httpError(409, 'This username is already taken.');
+  }
   const token = createToken();
   const now = Date.now();
   const passwordHash = await hashPassword(password);
   const insertUser = database.prepare(`
-    INSERT INTO users(id, email, display_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)
+    INSERT INTO users(id, email, username, display_name, password_hash, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
   const insertVerification = database.prepare(`
     INSERT INTO email_verifications(token_hash, user_id, expires_at) VALUES (?, ?, ?)
   `);
-  runTransaction(database, () => {
-    insertUser.run(userId, email, displayName, passwordHash, now);
-    insertVerification.run(hashToken(token), userId, now + VERIFY_TTL_MS);
-  });
+  try {
+    runTransaction(database, () => {
+      insertUser.run(userId, email, username, displayName, passwordHash, now);
+      insertVerification.run(hashToken(token), userId, now + VERIFY_TTL_MS);
+    });
+  } catch (error) {
+    if (error.code === 'ERR_SQLITE_CONSTRAINT_UNIQUE') {
+      throw httpError(409, 'This email address or username is already in use.');
+    }
+    throw error;
+  }
 
   const origin = process.env.PUBLIC_ORIGIN || requestUrl.origin;
   const verificationUrl = new URL('/', origin);
@@ -390,8 +494,9 @@ async function register(request, response, database, requestUrl) {
       displayName,
       verificationUrl: verificationUrl.toString()
     });
+    recordAuthEvent(database, request, 'registration', { userId, email });
     json(response, 201, {
-      message: 'Account created. Verify your email before signing in.',
+      message: 'Account created. You can now sign in with your email and password.',
       ...(mailResult.developmentUrl ? { developmentVerificationUrl: mailResult.developmentUrl } : {})
     });
   } catch (error) {
@@ -402,15 +507,18 @@ async function register(request, response, database, requestUrl) {
 
 async function resendVerification(request, response, database, requestUrl) {
   const body = await readJson(request);
-  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
-    throw httpError(400, 'Enter a valid email address.');
+  const identifier = typeof (body?.identifier ?? body?.email) === 'string'
+    ? String(body.identifier ?? body.email).trim().toLowerCase()
+    : '';
+  if (!identifier || identifier.length > 254) {
+    throw httpError(400, 'Enter your email address or username.');
   }
 
   const user = database.prepare(`
-    SELECT id, email, display_name, email_verified_at FROM users WHERE email = ?
-  `).get(email);
-  const message = 'If an unverified account exists for this email, a verification link has been sent.';
+    SELECT id, email, display_name, email_verified_at FROM users
+    WHERE email = ? OR username = ?
+  `).get(identifier, identifier);
+  const message = 'If an unverified account exists for this email or username, a verification link has been sent.';
   if (!user || user.email_verified_at) {
     json(response, 200, { message });
     return;
@@ -445,7 +553,7 @@ async function resendVerification(request, response, database, requestUrl) {
   });
 }
 
-function verifyEmail(response, database, url, isTls) {
+function verifyEmail(request, response, database, url, isTls) {
   const token = url.searchParams.get('token') || '';
   if (token.length < 32 || token.length > 128) throw httpError(400, 'Verification link is invalid or expired.');
   const verification = database.prepare(`
@@ -456,20 +564,106 @@ function verifyEmail(response, database, url, isTls) {
     database.prepare('UPDATE users SET email_verified_at = ? WHERE id = ?').run(Date.now(), verification.user_id);
     database.prepare('DELETE FROM email_verifications WHERE user_id = ?').run(verification.user_id);
   });
-  const user = establishSession(response, database, verification.user_id, isTls);
+  recordAuthEvent(database, request, 'email_verified', { userId: verification.user_id });
+  const user = establishSession(request, response, database, verification.user_id, isTls);
   json(response, 200, { message: 'Email verified. You are now signed in.', user });
+}
+
+async function requestPasswordReset(request, response, database, url) {
+  const body = await readJson(request);
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const user = email.length <= 254
+    ? database.prepare(`
+      SELECT id, email, display_name
+      FROM users
+      WHERE email = ? AND email_verified_at IS NOT NULL AND account_status = 'active'
+    `).get(email)
+    : null;
+
+  let developmentResetUrl = '';
+  if (user) {
+    try {
+      const mailResult = await issuePasswordReset(database, {
+        userId: user.id,
+        email: user.email,
+        displayName: user.display_name,
+        origin: process.env.PUBLIC_ORIGIN || url.origin
+      });
+      developmentResetUrl = mailResult.developmentUrl || '';
+      recordAuthEvent(database, request, 'password_reset_requested', { userId: user.id });
+    } catch (error) {
+      console.error('Unable to deliver password reset instructions:', error);
+    }
+  }
+
+  json(response, 200, {
+    message: 'If an active, verified account exists for this email, password reset instructions have been sent.',
+    ...(developmentResetUrl ? { developmentResetUrl } : {})
+  });
+}
+
+async function completePasswordReset(request, response, database, isTls) {
+  const body = await readJson(request);
+  const token = typeof body.token === 'string' ? body.token : '';
+  const password = typeof body.password === 'string' ? body.password : '';
+  if (token.length < 32 || token.length > 128) {
+    throw httpError(400, 'Password reset link is invalid or expired.');
+  }
+  if (password.length < 6 || password.length > 128) {
+    throw httpError(400, 'Password must be between 6 and 128 characters.');
+  }
+
+  const passwordHash = await hashPassword(password);
+  const now = Date.now();
+  let userId;
+  runTransaction(database, () => {
+    const reset = database.prepare(`
+      SELECT user_id FROM password_reset_tokens
+      WHERE token_hash = ? AND expires_at > ?
+    `).get(hashToken(token), now);
+    if (!reset) throw httpError(400, 'Password reset link is invalid or expired.');
+
+    userId = reset.user_id;
+    database.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
+    database.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(userId);
+    database.prepare(`
+      UPDATE sessions SET revoked_at = ?
+      WHERE user_id = ? AND revoked_at IS NULL
+    `).run(now, userId);
+  });
+
+  closeUserSockets(userId);
+  recordAuthEvent(database, request, 'password_reset', { userId });
+  clearSessionCookie(response, isTls);
+  json(response, 200, { message: 'Password updated. Sign in with your new password.' });
 }
 
 async function login(request, response, database, isTls) {
   const body = await readJson(request);
-  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const identifier = typeof (body.identifier ?? body.email) === 'string'
+    ? String(body.identifier ?? body.email).trim().toLowerCase()
+    : '';
   const password = typeof body.password === 'string' ? body.password : '';
-  const user = database.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const user = database.prepare('SELECT * FROM users WHERE email = ? OR username = ?')
+    .get(identifier, identifier);
   const validPassword = user && await verifyPassword(password, user.password_hash);
-  if (!validPassword) throw httpError(401, 'Email or password is incorrect.');
-  if (!user.email_verified_at) throw httpError(403, 'Verify your email before signing in.');
-
-  createSession(response, database, user.id, isTls);
+  if (!validPassword) {
+    recordAuthEvent(database, request, 'login_failed', {
+      userId: user?.id || null,
+      email: user?.email || identifier,
+      details: { reason: 'invalid_credentials' }
+    });
+    throw httpError(401, 'Email, username or password is incorrect.');
+  }
+  if (user.account_status !== 'active') {
+    recordAuthEvent(database, request, 'login_failed', {
+      userId: user.id,
+      email: user.email,
+      details: { reason: user.account_status }
+    });
+    throw httpError(403, 'This account is not active. Contact SignSpeak support.');
+  }
+  createSession(request, response, database, user.id, isTls);
 }
 
 async function loginWithGoogle(request, response, database, isTls, clientId, tokenVerifier) {
@@ -479,7 +673,7 @@ async function loginWithGoogle(request, response, database, isTls, clientId, tok
   }
 
   const identity = await tokenVerifier(body.credential, clientId);
-  await loginWithExternalIdentity(response, database, isTls, 'google', identity);
+  await loginWithExternalIdentity(request, response, database, isTls, 'google', identity);
 }
 
 async function loginWithFacebook(request, response, database, isTls, appId, appSecret, tokenVerifier) {
@@ -488,10 +682,10 @@ async function loginWithFacebook(request, response, database, isTls, appId, appS
     throw httpError(400, 'Facebook sign-in token is required.');
   }
   const identity = await tokenVerifier(body.accessToken, appId, appSecret);
-  await loginWithExternalIdentity(response, database, isTls, 'facebook', identity);
+  await loginWithExternalIdentity(request, response, database, isTls, 'facebook', identity);
 }
 
-async function loginWithExternalIdentity(response, database, isTls, provider, identity) {
+async function loginWithExternalIdentity(request, response, database, isTls, provider, identity) {
   if (
     !identity
     || typeof identity.subject !== 'string'
@@ -507,12 +701,25 @@ async function loginWithExternalIdentity(response, database, isTls, provider, id
   const linkedIdentity = database.prepare(
     'SELECT user_id FROM external_identities WHERE provider = ? AND subject = ?'
   ).get(provider, identity.subject);
-  const existingEmail = database.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
+  const existingEmail = database.prepare('SELECT id, account_status FROM users WHERE email = ?').get(normalizedEmail);
+  const linkedUserId = linkedIdentity?.user_id || existingEmail?.id;
+  const linkedUserStatus = linkedUserId
+    ? database.prepare('SELECT account_status FROM users WHERE id = ?').get(linkedUserId)?.account_status
+    : null;
+  if (linkedUserStatus && linkedUserStatus !== 'active') {
+    recordAuthEvent(database, request, 'login_failed', {
+      userId: linkedUserId,
+      email: normalizedEmail,
+      details: { reason: linkedUserStatus, provider }
+    });
+    throw httpError(403, 'This account is not active. Contact SignSpeak support.');
+  }
   const passwordHash = !linkedIdentity && !existingEmail
     ? await hashPassword(createToken())
     : null;
   const now = Date.now();
   let userId = linkedIdentity?.user_id || null;
+  let createdUser = false;
 
   if (!linkedIdentity) {
     try {
@@ -529,10 +736,12 @@ async function loginWithExternalIdentity(response, database, isTls, provider, id
           const displayName = cleanText(identity.displayName, 2, 80)
             || cleanText(localPart, 2, 80)
             || `${provider === 'facebook' ? 'Facebook' : 'Google'} user`;
+          const username = makeAvailableUsername(database, localPart, userId);
           database.prepare(`
-            INSERT INTO users(id, email, display_name, password_hash, email_verified_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).run(userId, normalizedEmail, displayName, passwordHash, now, now);
+            INSERT INTO users(id, email, username, display_name, password_hash, email_verified_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(userId, normalizedEmail, username, displayName, passwordHash, now, now);
+          createdUser = true;
         } else {
           database.prepare('UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?')
             .run(now, userId);
@@ -552,63 +761,50 @@ async function loginWithExternalIdentity(response, database, isTls, provider, id
     }
   }
 
-  createSession(response, database, userId, isTls);
+  const account = database.prepare('SELECT account_status FROM users WHERE id = ?').get(userId);
+  if (account?.account_status !== 'active') {
+    recordAuthEvent(database, request, 'login_failed', {
+      userId,
+      email: normalizedEmail,
+      details: { reason: account?.account_status || 'account_not_found', provider }
+    });
+    throw httpError(403, 'This account is not active. Contact SignSpeak support.');
+  }
+  if (createdUser) recordAuthEvent(database, request, 'registration', { userId, email: normalizedEmail, details: { provider } });
+  createSession(request, response, database, userId, isTls, provider);
 }
 
-function createSession(response, database, userId, isTls) {
-  const user = establishSession(response, database, userId, isTls);
+function createSession(request, response, database, userId, isTls, method = 'password') {
+  const user = establishSession(request, response, database, userId, isTls, method);
   json(response, 200, { user });
 }
 
-function establishSession(response, database, userId, isTls) {
+function establishSession(request, response, database, userId, isTls, method = 'email_verification') {
   const token = createToken();
+  const sessionId = randomUUID();
   const createdAt = Date.now();
   const expiresAt = createdAt + SESSION_TTL_MS;
-  database.prepare('INSERT INTO sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
-    .run(hashToken(token), userId, createdAt, expiresAt);
+  const userAgent = typeof request.headers['user-agent'] === 'string'
+    ? request.headers['user-agent'].slice(0, 512)
+    : null;
+  const ipAddress = request.socket.remoteAddress || null;
+  runTransaction(database, () => {
+    database.prepare(`
+      INSERT INTO sessions(
+        session_id, token_hash, user_id, created_at, expires_at,
+        last_seen_at, ip_address, user_agent
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(sessionId, hashToken(token), userId, createdAt, expiresAt, createdAt, ipAddress, userAgent);
+    database.prepare(`
+      UPDATE users SET last_login_at = ?, last_active_at = ?,
+        successful_login_count = successful_login_count + 1
+      WHERE id = ?
+    `).run(createdAt, createdAt, userId);
+    recordAuthEvent(database, request, 'login_success', { userId, details: { method } });
+    recordAuthEvent(database, request, 'session_created', { userId, details: { sessionId } });
+  });
   response.setHeader('Set-Cookie', sessionCookie(token, expiresAt, isTls));
   return getPublicUser(database, userId);
-}
-
-async function createContactInvite(request, response, database, user) {
-  const body = await readJson(request);
-  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
-  if (!email || email === user.email) throw httpError(400, 'Enter another verified SignSpeak account email.');
-  const target = database.prepare(`
-    SELECT id, email_verified_at FROM users WHERE email = ?
-  `).get(email);
-  if (!target || !target.email_verified_at) throw httpError(404, 'No verified SignSpeak account was found.');
-
-  const existing = database.prepare(`
-    SELECT id, status FROM contacts
-    WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)
-  `).get(user.id, target.id, target.id, user.id);
-  if (existing) throw httpError(409, existing.status === 'accepted' ? 'This user is already a contact.' : 'A contact request already exists.');
-
-  const contactId = randomUUID();
-  try {
-    database.prepare(`
-      INSERT INTO contacts(id, requester_id, addressee_id, status, created_at) VALUES (?, ?, ?, 'pending', ?)
-    `).run(contactId, user.id, target.id, Date.now());
-  } catch (error) {
-    if (error.code === 'ERR_SQLITE_CONSTRAINT_UNIQUE') throw httpError(409, 'A contact request already exists.');
-    throw error;
-  }
-  json(response, 201, { contact: { id: contactId, status: 'pending', email: target.email } });
-}
-
-function respondToContactInvite(response, database, userId, contactId, action) {
-  const status = action === 'accept' ? 'accepted' : 'delete';
-  const row = database.prepare(`
-    SELECT id FROM contacts WHERE id = ? AND addressee_id = ? AND status = 'pending'
-  `).get(contactId, userId);
-  if (!row) throw httpError(404, 'Incoming contact request not found.');
-  if (status === 'delete') {
-    database.prepare('DELETE FROM contacts WHERE id = ?').run(contactId);
-  } else {
-    database.prepare('UPDATE contacts SET status = ? WHERE id = ?').run(status, contactId);
-  }
-  json(response, 200, { ok: true });
 }
 
 async function handleSignalMessage(webSocket, message, database) {
@@ -617,14 +813,21 @@ async function handleSignalMessage(webSocket, message, database) {
 
   if (message.type === 'call:invite') {
     enforceSocketRateLimit(userId, 'call-invite', 10);
-    const contactId = cleanText(message.contactId, 36, 36);
+    const calleeId = cleanText(message.contactId, 36, 36);
     const mode = message.mode === 'deaf-to-hearing' ? 'deaf-to-hearing' : 'deaf-to-deaf';
-    const contact = database.prepare(`
-      SELECT requester_id, addressee_id FROM contacts
-      WHERE id = ? AND status = 'accepted' AND (requester_id = ? OR addressee_id = ?)
-    `).get(contactId, userId, userId);
-    if (!contact) throw httpError(403, 'Calls are limited to accepted contacts.');
-    const calleeId = otherParticipant(contact, userId);
+    if (!hasEnabledCallDevice(database, userId)) {
+      throw httpError(403, 'Calling is not enabled for this account. Contact the SignSpeak Super Admin.');
+    }
+    if (
+      !calleeId
+      || calleeId === userId
+      || !hasEnabledCallDevice(database, calleeId)
+      || !database.prepare(`
+        SELECT id FROM users WHERE id = ? AND account_status = 'active' AND email_verified_at IS NOT NULL
+      `).get(calleeId)
+    ) {
+      throw httpError(403, 'This account is not an approved SignSpeak calling contact.');
+    }
     const busy = database.prepare(`
       SELECT id FROM calls WHERE status IN ('ringing', 'connecting', 'connected')
         AND (caller_id = ? OR callee_id = ? OR caller_id = ? OR callee_id = ?)
@@ -637,7 +840,11 @@ async function handleSignalMessage(webSocket, message, database) {
       INSERT INTO calls(id, caller_id, callee_id, mode, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(callId, userId, calleeId, mode, 'ringing', now);
-    send(webSocket, { type: 'call:outgoing', callId, contactId, mode, status: 'ringing', createdAt: now });
+    recordUserActivity(database, {
+      socket: { remoteAddress: webSocket.ipAddress },
+      headers: { 'user-agent': webSocket.userAgent }
+    }, userId, 'call_initiated');
+    send(webSocket, { type: 'call:outgoing', callId, contactId: calleeId, mode, status: 'ringing', createdAt: now });
     const caller = getPublicUser(database, userId);
     if (!sendToUser(calleeId, {
       type: 'call:incoming',
@@ -657,9 +864,27 @@ async function handleSignalMessage(webSocket, message, database) {
     if (call.callee_id !== userId || call.status !== 'ringing') {
       throw httpError(403, 'This call invitation is no longer available.');
     }
+    if (message.type === 'call:accept'
+      && (!hasEnabledCallDevice(database, call.caller_id) || !hasEnabledCallDevice(database, call.callee_id))) {
+      finishCall(database, call, userId, 'interrupted');
+      throw httpError(403, 'Calling permission has been disabled for this account.');
+    }
     const status = message.type === 'call:accept' ? 'connecting' : 'declined';
     database.prepare('UPDATE calls SET status = ?, answered_at = ? WHERE id = ?')
       .run(status, status === 'connecting' ? Date.now() : null, call.id);
+    if (message.type === 'call:accept') {
+      notifyOtherUserDevices(userId, webSocket, {
+        type: 'call:claimed',
+        callId: call.id,
+        status
+      });
+    } else {
+      notifyOtherUserDevices(userId, webSocket, {
+        type: 'call:state',
+        callId: call.id,
+        status
+      });
+    }
     sendToUser(call.caller_id, {
       type: message.type === 'call:accept' ? 'call:accepted' : 'call:declined',
       callId: call.id,
@@ -673,6 +898,10 @@ async function handleSignalMessage(webSocket, message, database) {
   if (message.type === 'call:cancel' || message.type === 'call:end') {
     const call = getCallForParticipant(database, message.callId, userId);
     finishCall(database, call, userId, message.type === 'call:cancel' ? 'missed' : 'ended');
+    recordUserActivity(database, {
+      socket: { remoteAddress: webSocket.ipAddress },
+      headers: { 'user-agent': webSocket.userAgent }
+    }, userId, 'call_ended');
     return;
   }
 
@@ -680,6 +909,10 @@ async function handleSignalMessage(webSocket, message, database) {
     const call = getCallForParticipant(database, message.callId, userId);
     if (!['connecting', 'connected'].includes(call.status)) {
       throw httpError(409, 'This call is not connecting.');
+    }
+    if (!hasEnabledCallDevice(database, call.caller_id) || !hasEnabledCallDevice(database, call.callee_id)) {
+      finishCall(database, call, userId, 'interrupted');
+      return;
     }
     database.prepare('UPDATE calls SET status = ? WHERE id = ?').run('connected', call.id);
     const state = { type: 'call:state', callId: call.id, status: 'connected' };
@@ -693,6 +926,10 @@ async function handleSignalMessage(webSocket, message, database) {
     const call = getCallForParticipant(database, message.callId, userId);
     if (!['ringing', 'connecting', 'connected'].includes(call.status)) {
       throw httpError(409, 'This call is no longer active.');
+    }
+    if (!hasEnabledCallDevice(database, call.caller_id) || !hasEnabledCallDevice(database, call.callee_id)) {
+      finishCall(database, call, userId, 'interrupted');
+      return;
     }
     if (message.type === 'caption' || message.type === 'chat:message') {
       const text = cleanText(message.text, 1, 1000);
@@ -760,7 +997,7 @@ function sanitizeSignalPayload(message, callId) {
 }
 
 function finishCall(database, call, userId, status) {
-  if (!['ended', 'missed'].includes(status)) return;
+  if (!['ended', 'missed', 'interrupted'].includes(status)) return;
   const now = Date.now();
   database.prepare('UPDATE calls SET status = ?, ended_at = ? WHERE id = ?').run(status, now, call.id);
   const otherId = otherParticipant(call, userId);
@@ -779,18 +1016,29 @@ function getCallForParticipant(database, callId, userId) {
 }
 
 function listContacts(database, userId) {
+  if (!hasEnabledCallDevice(database, userId)) return [];
   return database.prepare(`
-    SELECT c.id, c.status, c.created_at, c.requester_id, c.addressee_id,
-           CASE WHEN c.requester_id = ? THEN other.id ELSE requester.id END AS user_id,
-           CASE WHEN c.requester_id = ? THEN other.display_name ELSE requester.display_name END AS display_name,
-           CASE WHEN c.requester_id = ? THEN other.email ELSE requester.email END AS email,
-           CASE WHEN c.requester_id = ? THEN 'outgoing' ELSE 'incoming' END AS direction
-    FROM contacts c
-    JOIN users requester ON requester.id = c.requester_id
-    JOIN users other ON other.id = c.addressee_id
-    WHERE c.requester_id = ? OR c.addressee_id = ?
-    ORDER BY c.created_at DESC
-  `).all(userId, userId, userId, userId, userId, userId);
+    SELECT u.id, u.id AS user_id, 'accepted' AS status,
+      NULL AS created_at, u.display_name, u.email,
+      'approved' AS direction,
+      COUNT(d.id) AS registered_devices
+    FROM users u
+    JOIN approved_call_devices d ON d.user_id = u.id
+    WHERE u.id <> ? AND u.account_status = 'active' AND u.email_verified_at IS NOT NULL
+      AND d.phone_verified_at IS NOT NULL AND d.calls_enabled = 1
+    GROUP BY u.id
+    ORDER BY u.display_name COLLATE NOCASE
+  `).all(userId).map((contact) => ({
+    ...contact,
+    online: Boolean(socketsByUser.get(contact.user_id)?.size)
+  }));
+}
+
+function hasEnabledCallDevice(database, userId) {
+  return Boolean(database.prepare(`
+    SELECT 1 FROM approved_call_devices
+    WHERE user_id = ? AND phone_verified_at IS NOT NULL AND calls_enabled = 1
+  `).get(userId));
 }
 
 function requireUser(request, response, database) {
@@ -799,6 +1047,11 @@ function requireUser(request, response, database) {
     json(response, 401, { error: 'Sign in is required.' });
     return null;
   }
+  const sessionToken = getCookie(request, 'ss_session');
+  const now = Date.now();
+  database.prepare('UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?')
+    .run(now, hashToken(sessionToken));
+  database.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(now, user.id);
   return user;
 }
 
@@ -807,14 +1060,18 @@ function findUserFromSession(request, database) {
   if (!token) return null;
   const now = Date.now();
   const session = database.prepare(`
-    SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?
+    SELECT s.user_id FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ? AND s.expires_at > ?
+      AND s.revoked_at IS NULL AND u.account_status = 'active'
   `).get(hashToken(token), now);
   return session ? getPublicUser(database, session.user_id) : null;
 }
 
 function getPublicUser(database, userId) {
   return database.prepare(`
-    SELECT id, email, display_name AS displayName, email_verified_at AS emailVerifiedAt
+    SELECT id, email, username, display_name AS displayName, profile_image_url AS profileImageUrl,
+      email_verified_at AS emailVerifiedAt, role, account_status AS accountStatus
     FROM users WHERE id = ?
   `).get(userId) || null;
 }
@@ -833,7 +1090,14 @@ function expireOldRecords(database) {
   const now = Date.now();
   database.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
   database.prepare('DELETE FROM email_verifications WHERE expires_at <= ?').run(now);
+  database.prepare('DELETE FROM password_reset_tokens WHERE expires_at <= ?').run(now);
   database.prepare('DELETE FROM recordings WHERE expires_at <= ?').run(now);
+  if (now - lastTelemetryPruneAt >= 24 * 60 * 60 * 1000) {
+    const cutoff = now - TELEMETRY_RETENTION_MS;
+    database.prepare('DELETE FROM auth_events WHERE created_at <= ?').run(cutoff);
+    database.prepare('DELETE FROM user_activity WHERE created_at <= ?').run(cutoff);
+    lastTelemetryPruneAt = now;
+  }
   database.prepare(`
     UPDATE calls SET status = 'missed', ended_at = ?
     WHERE status = 'ringing' AND created_at <= ?
@@ -861,10 +1125,53 @@ function sendToUser(userId, message) {
   const userSockets = socketsByUser.get(userId);
   if (!userSockets?.size) return false;
   const payload = JSON.stringify(message);
+  let sent = false;
   for (const webSocket of userSockets) {
-    if (webSocket.readyState === WebSocket.OPEN) webSocket.send(payload);
+    if (webSocket.readyState === WebSocket.OPEN) {
+      webSocket.send(payload);
+      sent = true;
+    }
   }
-  return true;
+  return sent;
+}
+
+function notifyOtherUserDevices(userId, excludedSocket, message) {
+  const userSockets = socketsByUser.get(userId);
+  if (!userSockets?.size) return;
+  for (const webSocket of userSockets) {
+    if (webSocket !== excludedSocket) send(webSocket, message);
+  }
+}
+
+function getConnectionInfo(userId) {
+  const sockets = [...(socketsByUser.get(userId) || [])]
+    .filter((webSocket) => webSocket.readyState === WebSocket.OPEN);
+  const isMobile = (webSocket) => /android|iphone|ipad|ipod|mobile/i.test(webSocket.userAgent || '');
+  return {
+    online: sockets.length > 0,
+    connectedSessions: sockets.length,
+    mobileConnected: sockets.some(isMobile),
+    desktopConnected: sockets.some((webSocket) => !isMobile(webSocket))
+  };
+}
+
+function terminateUserCalls(database, userId) {
+  const calls = database.prepare(`
+    SELECT id, caller_id, callee_id FROM calls
+    WHERE status IN ('ringing', 'connecting', 'connected')
+      AND (caller_id = ? OR callee_id = ?)
+  `).all(userId, userId);
+  for (const call of calls) finishCall(database, call, userId, 'interrupted');
+}
+
+function closeUserSockets(userId, sessionId = null) {
+  const userSockets = socketsByUser.get(userId);
+  if (!userSockets) return;
+  for (const webSocket of userSockets) {
+    if (!sessionId || webSocket.sessionId === sessionId) {
+      webSocket.close(4001, 'SignSpeak session revoked');
+    }
+  }
 }
 
 function send(webSocket, message) {
@@ -950,6 +1257,22 @@ function cleanText(value, minLength, maxLength) {
   if (typeof value !== 'string') return '';
   const text = value.trim();
   return text.length >= minLength && text.length <= maxLength ? text : '';
+}
+
+function makeAvailableUsername(database, preferredUsername, userId) {
+  const base = preferredUsername.toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 32);
+  const safeBase = base.length >= 3 ? base : 'user';
+  let candidate = safeBase;
+  let sequence = 1;
+  while (database.prepare('SELECT id FROM users WHERE username = ?').get(candidate)) {
+    const suffix = `-${userId.replace(/-/g, '').slice(0, 5)}${sequence > 1 ? sequence : ''}`;
+    candidate = `${safeBase.slice(0, 32 - suffix.length)}${suffix}`;
+    sequence += 1;
+  }
+  return candidate;
 }
 
 function json(response, status, payload) {

@@ -3,9 +3,10 @@ import { spawn } from 'node:child_process';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
 
+const host = process.env.HOST || '127.0.0.1';
 const children = [
   spawn(process.execPath, ['server/index.js'], { stdio: 'inherit' }),
-  spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1'], {
+  spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', host], {
     stdio: 'inherit'
   })
 ];

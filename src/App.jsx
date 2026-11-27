@@ -83,7 +83,12 @@ const HAND_CONNECTIONS = [
 const FINGERTIPS = [4, 8, 12, 16, 20];
 
 export default function App() {
-  const { currentCall, sendSignal, setLocalVideoStream } = useAccount();
+  const { currentCall, sendSignal, setLocalVideoStream, trackActivity } = useAccount();
+  const recordActivity = (action) => {
+    trackActivity(action).catch((error) => {
+      console.error('Unable to record SignSpeak activity:', error);
+    });
+  };
   const currentCallRef = useRef(currentCall);
   currentCallRef.current = currentCall;
   const videoRef = useRef(null);
@@ -97,6 +102,7 @@ export default function App() {
   const activeTabRef = useRef(activeTab);
   useEffect(() => {
     activeTabRef.current = activeTab;
+    if (activeTab === 'record') recordActivity('dataset_studio_used');
   }, [activeTab]);
 
   // MediaPipe Vision & Camera States
@@ -452,6 +458,7 @@ export default function App() {
             await videoRef.current.play();
             if (streamRef.current !== stream) return;
             setCameraStatus('active');
+            recordActivity('recognition_started');
             startDetectionLoop();
             await refreshCameraDevices();
           } catch (err) {
@@ -482,6 +489,7 @@ export default function App() {
   };
 
   const stopCamera = () => {
+    const wasActive = Boolean(streamRef.current);
     if (animFrameIdRef.current) {
       cancelAnimationFrame(animFrameIdRef.current);
       animFrameIdRef.current = null;
@@ -503,6 +511,7 @@ export default function App() {
     latestLandmarkerResultRef.current = null;
     setCameraStatus('idle');
     setErrorMessage('');
+    if (wasActive) recordActivity('recognition_stopped');
     setDetectedHandsCount(0);
     setFps(0);
     setLiveCollectingFrames(0);
@@ -716,6 +725,7 @@ export default function App() {
     setWordBuffer((prev) => [...prev, word].slice(-3));
     setSentenceBuilder((prev) => [...prev, { word, confidence }]);
     setHasTrailingSpace(false);
+    recordActivity('sentence_action');
 
     if (subtitleFadeTimerRef.current) {
       clearTimeout(subtitleFadeTimerRef.current);
@@ -740,16 +750,21 @@ export default function App() {
   const handleClearSentence = () => {
     setSentenceBuilder([]);
     setHasTrailingSpace(false);
+    recordActivity('sentence_action');
     showNotification('Sentence cleared', 'info');
   };
 
   const handleDeleteLastWord = () => {
     setSentenceBuilder((prev) => prev.slice(0, -1));
     setHasTrailingSpace(false);
+    recordActivity('sentence_action');
   };
 
   const handleInsertSpace = () => {
-    if (sentenceBuilder.length > 0) setHasTrailingSpace(true);
+    if (sentenceBuilder.length > 0) {
+      setHasTrailingSpace(true);
+      recordActivity('sentence_action');
+    }
   };
 
   const handleCapitalizeSentence = () => {
@@ -758,6 +773,7 @@ export default function App() {
         ? { ...item, word: item.word.charAt(0).toUpperCase() + item.word.slice(1) }
         : item
     )));
+    recordActivity('sentence_action');
   };
 
   const handleSpeakSentence = () => {
@@ -798,6 +814,7 @@ export default function App() {
     link.click();
     link.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    recordActivity('text_exported');
   };
 
   const handleCopySentence = () => {
@@ -807,6 +824,7 @@ export default function App() {
       return;
     }
     navigator.clipboard.writeText(textToCopy).then(() => {
+      recordActivity('sentence_action');
       showNotification('Sentence copied to clipboard!', 'success');
     }).catch(() => {
       showNotification('Failed to copy', 'error');
@@ -868,6 +886,7 @@ export default function App() {
     link.href = offscreen.toDataURL('image/png');
     link.click();
 
+    recordActivity('screenshot_created');
     showNotification('HUD Screenshot captured and downloaded!', 'success');
   };
 
@@ -1467,6 +1486,7 @@ export default function App() {
       downloadAnchor.remove();
       URL.revokeObjectURL(url);
 
+      recordActivity('dataset_studio_used');
       showNotification(`Downloaded ${totalSamples} samples dataset file!`, 'success');
     } catch (err) {
       console.error('Failed to export dataset:', err);
@@ -1501,6 +1521,7 @@ export default function App() {
         timestamp: Date.now()
       });
 
+      recordActivity('dataset_studio_used');
       const updated = await getCountsByWord();
       setWordCounts(updated);
       showNotification(
@@ -1550,6 +1571,7 @@ export default function App() {
       link.remove();
       URL.revokeObjectURL(url);
 
+      recordActivity('dataset_studio_used');
       showNotification(`Downloaded ${total} samples as JSON file!`, 'success');
     } catch (err) {
       console.error('Download samples error:', err);

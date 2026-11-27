@@ -1,35 +1,74 @@
 # SignSpeak
 
-<<<<<<< HEAD
-Real-time sign-language recognition in the browser, with live subtitles and a sentence builder.
+SignSpeak is a React application for webcam-based sign recognition and accessible video conversations. Hand landmarks and the bundled word model run in the browser. Account, contact, call-signaling, and administrator data use a Node.js API and SQLite database.
 
-SignSpeak reads hand signs from your webcam and shows each recognised word as a subtitle. Words can be built into a sentence, copied, exported as a text file, or read aloud. Recognition runs entirely in the browser: video frames are not sent to a server.
+## Features
 
-## Demo
+- In-browser webcam recognition for the bundled 23-word classifier, with live subtitles, confidence scores, and a sentence builder.
+- Camera controls, mirror and ghost modes, screenshots, text export, and optional speech output.
+- Verified accounts, Google/Facebook sign-in when configured, Super Admin-approved calling devices, WebRTC calls, captions, text chat, and call history.
+- A protected `/admin` console for account management, role/permission assignments, session revocation, reports, authentication and usage history, contact/call metadata, and append-only administrator audit logs.
+- Admin actions are checked by the API as well as the interface. `super_admin` is provisioned from the server environment; other admins receive explicit permissions.
 
-TODO before submission: add the deployed link and the 60-second demo video.
+Recognition runs in the browser. Feature telemetry records action metadata only: it does not collect webcam video, microphone audio, sentence text, or call content. Authentication and feature events are retained for 90 days. Call recording is not enabled.
 
-## Feature status
+## Requirements and running locally
 
-| Feature | Status |
+- Node.js 22.13 or newer (the backend uses Node's built-in `node:sqlite`)
+- npm
+- A webcam and internet access for the first load (MediaPipe assets are loaded from a CDN)
+
+```bash
+npm install
+npm run dev
+```
+
+Open the Vite URL printed in the terminal (normally `http://127.0.0.1:5173`). Create an account with a unique username, email, and password. You can sign in immediately without verifying email; verification is still needed for verified-account features such as Super Admin bootstrap and approved calling. In development, new accounts receive an optional verification link in the app. Browser camera and microphone permissions are needed for recognition and calls.
+
+## Cross-device calling
+
+The app is installable as a PWA from a supported mobile browser. A Super Admin must add an existing, email-verified account under **Approved Call Devices**, record its E.164 phone number and device label, manually confirm the number, and enable calling. Users cannot add or approve phone numbers. This build has no SMS/OTP provider, so the phone check is an administrator attestation rather than an automated phone challenge.
+
+The approved directory shows account presence from authenticated WebSocket sessions. Calls use browser WebRTC; camera and microphone access starts only after the recipient accepts. Incoming calls ring all active sessions for that account, and accepting on one device dismisses the invitation on its other sessions. Browser notifications can be enabled while SignSpeak is running. Background push delivery when the browser/app is closed is not configured; mobile users must keep SignSpeak open to receive calls.
+
+For laptop-to-phone testing, serve SignSpeak from a network-reachable host over HTTPS with a certificate trusted by both devices. Browser camera/microphone APIs are blocked on ordinary HTTP LAN origins. For local Vite development, set `HOST=0.0.0.0`, set `DEV_TLS_CERT_PATH` and `DEV_TLS_KEY_PATH` for HTTPS, and set `TRUST_PROXY=1` for the local Vite-to-API proxy. Configure a public TURN service with `TURN_URLS` and `TURN_SHARED_SECRET` for reliable calls across NATs and restrictive networks. STUN alone cannot guarantee connectivity on every network. Calls are SignSpeak-to-SignSpeak over the internet and do not use PSTN dialing.
+
+Useful checks:
+
+```bash
+npm run build
+npm run test:server
+```
+
+## Administrator setup
+
+1. Register the account that should become Super Admin using the email and password you want to use.
+2. Verify that email; verification is required to bootstrap a Super Admin.
+3. Stop the running SignSpeak server.
+4. Copy `.env.example` to `.env` if needed and set `SUPER_ADMIN_EMAIL` to that account's exact email address.
+5. Restart SignSpeak. The server verifies that the address belongs to an existing verified account, then grants the `super_admin` role. Remove the environment setting after bootstrap if preferred; the database role remains.
+
+There is no shared/default admin email or password. Sign in at `/admin` using the account credentials chosen at registration. Under **Admin Profile**, an administrator can change their username, email, and password. Changing username, email, or password requires the current password; an email change sends a verification link and revokes other active sessions. Do not put credentials in the frontend or commit `.env`. Admins can be promoted by a Super Admin and must be assigned explicit permissions. Password reset links are single-use, expire after 30 minutes, and revoke the account's existing sessions.
+
+Schema migrations are applied additively when the API starts. Before changing an existing database, the migration creates a timestamped backup in `server/data/backups/`. The default database is `server/data/signspeak.sqlite`; set `SIGNSPEAK_DB_PATH` to use another file.
+
+## Server configuration
+
+| Variable | Purpose |
 | --- | --- |
-| Webcam capture and 21-point hand tracking (MediaPipe Hand Landmarker, GPU with CPU fallback) | Implemented |
-| In-browser neural recognition of 23 words | Implemented. Accuracy not yet measured in this repository |
-| Live HUD with confidence, stability, FPS and latency | Implemented |
-| Subtitles with held-sign suppression and an "Uncertain - please repeat" state | Implemented |
-| Sentence builder: add space, delete last word, clear, capitalise, copy, export as .txt | Implemented |
-| Read the sentence aloud (Web Speech API) | Implemented. Depends on browser support |
-| Screenshot that follows the current Mirror and Ghost settings | Implemented |
-| Caption size: small, medium, large | Implemented |
-| Hand mode (both, right, left), mirror view, ghost mode | Implemented |
-| Dataset Studio: record and export samples | Partial. Recorded format differs from live recognition (see Known limitations) |
-| Accessibility: keyboard shortcuts, focus rings, live subtitle region | Partial. Caption contrast and position are not yet adjustable |
-| Two-user video calling with WebRTC | Planned |
-| Live sign captions during calls | Planned |
-| Call history and consent-based recording | Planned |
-| Accounts and backend (authentication, contacts) | Planned |
-| A to Z alphabet recognition | Planned |
-| Gesture-controlled visual effects mode | Planned |
+| `HOST`, `PORT` | Backend bind address and port; defaults to `127.0.0.1:3001`. |
+| `DEV_TLS_CERT_PATH`, `DEV_TLS_KEY_PATH` | Optional trusted TLS certificate and key for HTTPS from the Vite development server. |
+| `SIGNSPEAK_DB_PATH` | SQLite database path. |
+| `PUBLIC_ORIGIN` | Canonical app origin for verification and password-reset links. |
+| `SUPER_ADMIN_EMAIL` | Optional existing, verified account email for Super Admin bootstrap. |
+| `GOOGLE_CLIENT_ID` | Google Identity Services OAuth client ID. |
+| `FACEBOOK_APP_ID`, `FACEBOOK_APP_SECRET` | Meta app credentials; keep the secret server-side. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | Required for production verification and password-reset email. Optional `SMTP_FROM` sets the sender address. |
+| `TURN_URLS`, `TURN_SHARED_SECRET` | Optional TURN service settings for reliable WebRTC calls. Keep the shared secret private. |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | TLS certificate and key when Node terminates HTTPS. |
+| `TRUST_PROXY=1` | Use only behind a trusted HTTPS reverse proxy that sets `X-Forwarded-Proto`. |
+
+For production, serve the built `dist` files over HTTPS and proxy `/api` and `/api/signaling` to the backend over a trusted connection. Set `NODE_ENV=production`, `PUBLIC_ORIGIN`, and SMTP settings. Configure TURN for calls across restrictive networks. The other participant and STUN/TURN providers may learn connection metadata such as IP addresses.
 
 ## Keyboard shortcuts
 
@@ -44,105 +83,31 @@ TODO before submission: add the deployed link and the 60-second demo video.
 | C | Clear the current subtitle |
 | X | Copy the current word |
 | G | Toggle ghost mode |
-| E | Export the sentence as a text file |
-| Backspace | Delete the last word in the sentence |
-
-## Getting started
-
-Requirements:
-- Node.js 18.18 or newer (20 LTS recommended)
-- A webcam
-- An internet connection the first time the app loads. The MediaPipe runtime and model are downloaded from a CDN.
-=======
-SignSpeak is a React application for webcam-based sign recognition and accessible video conversations. Hand landmarks and the bundled word model run in the browser. Account, contact, and call-signaling data use the Node.js API and SQLite database.
-
-## Current implementation status
-
-- The bundled classifier recognizes 23 word labels; it does not recognize ASL A-Z.
-- Account registration, email verification, sign-in/out, profile editing, account deletion, and contact requests are implemented.
-- Accepted contacts can start WebRTC video/audio calls. Sign captions, optional speech-to-text captions, text chat, call history, and basic call controls are available.
-- The default development email flow provides a local verification link. Production email delivery requires SMTP.
-- Recording is **not enabled**. The call UI can exchange consent requests and responses, but does not capture, store, encrypt, play, or delete recordings.
-- Ghost mode is a grid preview, not person segmentation. Calibration and gesture-controlled visual effects are not implemented.
-- Accuracy targets are not measured results. A-Z recognition and accuracy claims require a valid labeled dataset, compatible trained weights, and signer/session-separated evaluation.
-- WebRTC uses public STUN by default. Configure a TURN service for reliable calls across restrictive networks. The other participant and STUN/TURN providers may learn connection metadata such as IP addresses.
-
-## Requirements
-
-- Node.js 22.13 or newer (the backend uses Node's built-in `node:sqlite`).
-- npm.
-
-## Install and run
->>>>>>> 27de5da (Update SignSpeak project)
-
-```bash
-npm install
-npm run dev
-```
-
-<<<<<<< HEAD
-Open http://localhost:5173 and allow camera access.
-
-To create a production build:
-
-```bash
-npm run build
-npm run preview
-```
-
-## How it works
-
-1. The webcam frame goes to MediaPipe Hand Landmarker, which returns 21 points per hand.
-2. For each frame, `src/utils/features.js` builds 138 values: relative hand coordinates for both hands, wrist positions, and wrist velocity.
-3. While a hand is visible, frames are collected (up to 3 seconds) and resampled to a 32-frame window.
-4. `src/utils/signModel.js` runs the trained model in plain JavaScript: Conv1D, BatchNorm, Bidirectional GRU, Dense, and softmax over 23 words.
-5. A prediction with confidence of 0.5 or more becomes a subtitle. Lower-confidence results show "Uncertain - please repeat".
-
-## Project structure
-
-```
-src/
-  App.jsx              UI, camera loop, recognition state, Dataset Studio
-  main.jsx             React entry point
-  index.css            Global styles and Tailwind layers
-  utils/
-    features.js        138-value feature extraction and mirror handling
-    signModel.js       Browser inference engine for the trained model
-    db.js              IndexedDB storage for recorded samples
-public/
-  model_weights.json   Trained model weights (Keras export)
-  labels.json          The 23 word labels
-```
+| E | Export the sentence |
+| Backspace | Delete the last sentence word, except while editing a form field |
 
 ## Known limitations
 
-- **Accuracy:** The 84% and 84.4% figures are team-reported. This repository does not yet include the training or evaluation code, so these numbers are not reproduced here.
-- **Dataset Studio:** Samples recorded in the browser use a 126-value format (30 frames, no wrist features or velocity, no mirror correction). Live recognition uses 138 values over 32 frames. Do not train a model from browser-recorded data until this is fixed. The issue is marked with a TODO in `src/utils/db.js`.
-- **Network:** The MediaPipe runtime and model are loaded from cdn.jsdelivr.net and storage.googleapis.com, so the app needs internet on first load.
-- **Browser support:** Text-to-speech and some other features depend on the browser.
-- **Tests:** There are no automated tests yet. The build (`npm run build`) is the only check.
+- The bundled classifier recognizes 23 word labels; it does not recognize ASL A-Z. Accuracy figures are not measured results in this repository.
+- Dataset Studio currently records 126-value, 30-frame samples, while live recognition uses 138 values over 32 frames. Do not train a model from browser-recorded data until this mismatch is resolved.
+- Ghost mode is a grid preview, not person segmentation. Call recording capture and protected storage are not implemented.
+- MediaPipe assets are loaded from `cdn.jsdelivr.net` and `storage.googleapis.com`, so first-time use requires internet access.
+- Text-to-speech and some other features depend on browser support.
 
-## License
+## Project structure
 
-To be decided by the team before publishing.
-=======
-Open the Vite URL printed in the terminal (normally `http://127.0.0.1:5173`). In development, newly registered accounts receive a verification link in the app; follow it, then sign in. Browser camera and microphone permissions are needed for recognition and calls.
-
-Run the backend alone with `npm run server`. Run the targeted backend checks with `npm run test:server`. Create a production frontend bundle with `npm run build`.
-
-## Server configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `HOST` | Backend bind address; defaults to `127.0.0.1`. |
-| `PORT` | Backend port; defaults to `3001`. |
-| `SIGNSPEAK_DB_PATH` | SQLite file path; defaults to `server/data/signspeak.sqlite`. |
-| `PUBLIC_ORIGIN` | Canonical public app origin used for origin checks and verification links. |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | Required for production email verification. Optional `SMTP_FROM` sets the sender address. |
-| `TURN_URLS` | Comma-separated TURN URLs, for example `turn:turn.example.net:3478?transport=udp`. |
-| `TURN_SHARED_SECRET` | TURN REST shared secret; used server-side to issue short-lived credentials. Keep it private. |
-| `TLS_CERT_PATH`, `TLS_KEY_PATH` | TLS certificate/key when Node terminates HTTPS directly. |
-| `TRUST_PROXY=1` | Use only behind a trusted HTTPS reverse proxy that sets `X-Forwarded-Proto`. |
-
-For production, serve the built `dist` files over HTTPS and proxy `/api` and `/api/signaling` to the backend over a trusted connection. Set `NODE_ENV=production`, `PUBLIC_ORIGIN`, and SMTP settings. Configure TURN for dependable calls. Keep the SQLite database and server secrets protected and backed up. Do not expose `TURN_SHARED_SECRET` or SMTP credentials to frontend code.
->>>>>>> 27de5da (Update SignSpeak project)
+```text
+src/
+  App.jsx                  Recognition UI, camera loop, sentence builder, Dataset Studio
+  components/AccountShell  Authentication, contacts, calls, and app routing
+  components/admin/        Administrator console
+  utils/features.js        138-value feature extraction and mirror handling
+  utils/signModel.js       Browser inference engine
+server/
+  index.js                 HTTP/WebSocket API and authentication
+  db.js                    SQLite schema and additive migrations
+  admin.js                 Admin APIs, permissions, audit and activity metadata
+public/
+  model_weights.json       Trained model weights
+  labels.json              Model labels
+```
