@@ -187,6 +187,7 @@ export async function clearAllRecordings() {
  * - If a hand is missing in this frame, filled with 63 zeros.
  * Total = 126 numbers.
  */
+// TODO(data-pipeline): this 126-value format differs from features.js (138 values, mirror-corrected, normalised). Fix in the next session.
 export function extractRelativeHandLandmarks(results) {
   // Pre-fill 126 numbers with 0
   const frameNumbers = new Array(126).fill(0);

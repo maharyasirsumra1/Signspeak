@@ -8,7 +8,6 @@ import {
   RefreshCw,
   CheckCircle2,
   FlipHorizontal,
-  Subtitles,
   Layers,
   Zap,
   Radio,
@@ -17,17 +16,11 @@ import {
   Trash2,
   Database,
   Check,
-  BrainCircuit,
   RotateCcw,
-  Square,
   Camera,
   Copy,
-  Eye,
-  EyeOff,
   Pause,
   Activity,
-  Clock,
-  ShieldCheck,
   Sparkles,
   Terminal,
   Save
@@ -61,6 +54,7 @@ export const SKELETON_OPACITY = 0.8; // opacity of hand skeleton (0.0 to 1.0, 80
 export const HAND_BOX_LINE_WIDTH = 2; // px: thickness of hand bounding box
 export const HAND_BOX_LABEL_FONT_SIZE = 12; // px: font size of hand box label
 export const HUD_PROGRESS_BAR_HEIGHT = 4; // px: height of HUD progress bars
+const ACCEPT_CONFIDENCE = 0.5;
 
 // The 21 hand landmarks connection pairs defined by MediaPipe
 const HAND_CONNECTIONS = [
@@ -182,9 +176,17 @@ export default function App() {
 
   // Subtitle Bar (Single most recent recognized word, 4s fade)
   const [currentSubtitle, setCurrentSubtitle] = useState('');
+  const [currentConfidence, setCurrentConfidence] = useState(null);
   const [isSubtitleFaded, setIsSubtitleFaded] = useState(false);
   const [wordBuffer, setWordBuffer] = useState([]); // Last 3 recognized words
   const subtitleFadeTimerRef = useRef(null);
+  const [sentenceBuilder, setSentenceBuilder] = useState([]);
+  const [hasTrailingSpace, setHasTrailingSpace] = useState(false);
+  const sentenceText = `${sentenceBuilder.map((item) => item.word).join(' ')}${
+    hasTrailingSpace ? ' ' : ''
+  }`;
+  const [captionSize, setCaptionSize] = useState('medium');
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
   // Live HUD Recognition Telemetry State
   const [hudData, setHudData] = useState({
@@ -207,6 +209,8 @@ export default function App() {
   const collectedFramesRef = useRef([]);
   const gestureStartTimeRef = useRef(null);
   const noHandsStartTimeRef = useRef(null);
+  const handAbsentSinceRef = useRef(null);
+  const lastAcceptedWordRef = useRef(null);
   const prevWristCoordsRef = useRef(null);
   const cooldownUntilRef = useRef(0);
   const [liveCollectingFrames, setLiveCollectingFrames] = useState(0);
@@ -626,14 +630,21 @@ export default function App() {
   };
 
   // 8. Subtitle Update (single most recent recognized word, 4s fade)
-  const showRecognizedWord = (word) => {
+  const showRecognizedWord = (word, confidence) => {
+    const acceptedWord = word.toLowerCase();
+    if (lastAcceptedWordRef.current === acceptedWord) return;
+    lastAcceptedWordRef.current = acceptedWord;
     setIsSubtitleFaded(false);
     setCurrentSubtitle(word);
+    setCurrentConfidence(confidence);
     setWordBuffer((prev) => [...prev, word].slice(-3));
+    setSentenceBuilder((prev) => [...prev, { word, confidence }]);
+    setHasTrailingSpace(false);
 
     if (subtitleFadeTimerRef.current) {
       clearTimeout(subtitleFadeTimerRef.current);
     }
+    subtitleFadeTimerRef.current = null;
     subtitleFadeTimerRef.current = setTimeout(() => {
       setIsSubtitleFaded(true);
     }, 4000);
@@ -641,6 +652,7 @@ export default function App() {
 
   const handleClearSubtitle = () => {
     setCurrentSubtitle('');
+    setCurrentConfidence(null);
     setIsSubtitleFaded(false);
     if (subtitleFadeTimerRef.current) {
       clearTimeout(subtitleFadeTimerRef.current);
@@ -649,10 +661,87 @@ export default function App() {
     showNotification('Subtitles cleared', 'info');
   };
 
+  const handleClearSentence = () => {
+    setSentenceBuilder([]);
+    setHasTrailingSpace(false);
+    showNotification('Sentence cleared', 'info');
+  };
+
+  const handleDeleteLastWord = () => {
+    setSentenceBuilder((prev) => prev.slice(0, -1));
+    setHasTrailingSpace(false);
+  };
+
+  const handleInsertSpace = () => {
+    if (sentenceBuilder.length > 0) setHasTrailingSpace(true);
+  };
+
+  const handleCapitalizeSentence = () => {
+    setSentenceBuilder((prev) => prev.map((item, index) => (
+      index === 0
+        ? { ...item, word: item.word.charAt(0).toUpperCase() + item.word.slice(1) }
+        : item
+    )));
+  };
+
+  const handleSpeakSentence = () => {
+    if (!sentenceText.trim()) {
+      showNotification('Build or recognize a sentence first', 'info');
+      return;
+    }
+    if (!('speechSynthesis' in window)) {
+      showNotification('Text-to-speech is not supported by this browser', 'error');
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(sentenceText);
+    utterance.onend = () => setIsSpeaking(false);
+    utterance.onerror = () => setIsSpeaking(false);
+    setIsSpeaking(true);
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const handleStopSpeaking = () => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeaking(false);
+  };
+
+  const handleExportSentence = () => {
+    if (!sentenceText.trim()) {
+      showNotification('No sentence to export', 'info');
+      return;
+    }
+    const blob = new Blob([sentenceText], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `signspeak_sentence_${Date.now()}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleCopySentence = () => {
+    const textToCopy = sentenceText;
+    if (!textToCopy) {
+      showNotification('No sentence to copy', 'info');
+      return;
+    }
+    navigator.clipboard.writeText(textToCopy).then(() => {
+      showNotification('Sentence copied to clipboard!', 'success');
+    }).catch(() => {
+      showNotification('Failed to copy', 'error');
+    });
+  };
+
   const handleCopyWord = () => {
-    if (currentSubtitle) {
-      navigator.clipboard.writeText(currentSubtitle).then(() => {
-        showNotification(`Copied "${currentSubtitle}" to clipboard!`, 'success');
+    const textToCopy = currentSubtitle;
+    if (textToCopy) {
+      navigator.clipboard.writeText(textToCopy).then(() => {
+        showNotification(`Copied "${textToCopy}" to clipboard!`, 'success');
       }).catch(() => {
         showNotification('Failed to copy', 'error');
       });
@@ -675,12 +764,12 @@ export default function App() {
     offscreen.height = h;
     const octx = offscreen.getContext('2d');
 
-    if (isMirrored) {
+    if (isMirroredRef.current) {
       octx.translate(w, 0);
       octx.scale(-1, 1);
     }
 
-    if (isGhostMode) {
+    if (isGhostModeRef.current) {
       octx.fillStyle = '#020617';
       octx.fillRect(0, 0, w, h);
       octx.strokeStyle = 'rgba(6, 182, 212, 0.15)';
@@ -737,8 +826,21 @@ export default function App() {
         timestamp: Date.now()
       });
 
-      if (top1 && top1.confidence > 0.5) {
-        showRecognizedWord(top1.word);
+      if (top1 && top1.confidence >= ACCEPT_CONFIDENCE) {
+        showRecognizedWord(top1.word, top1.confidence);
+      } else if (top1) {
+        setIsSubtitleFaded(false);
+        setCurrentSubtitle('Uncertain - please repeat');
+        setCurrentConfidence(null);
+        if (subtitleFadeTimerRef.current) {
+          clearTimeout(subtitleFadeTimerRef.current);
+        }
+        subtitleFadeTimerRef.current = setTimeout(() => {
+          setCurrentSubtitle((current) => (
+            current === 'Uncertain - please repeat' ? '' : current
+          ));
+          subtitleFadeTimerRef.current = null;
+        }, 2000);
       }
     } catch (err) {
       console.error('Sign recognition error:', err);
@@ -747,6 +849,18 @@ export default function App() {
 
   // Process live frame for subtitle collection
   const handleLiveRecognitionFrame = (results, hasHands, now, frameFeatures = null, frameWrists = null) => {
+    if (hasHands) {
+      if (
+        handAbsentSinceRef.current !== null &&
+        now - handAbsentSinceRef.current >= 600
+      ) {
+        lastAcceptedWordRef.current = null;
+      }
+      handAbsentSinceRef.current = null;
+    } else if (handAbsentSinceRef.current === null) {
+      handAbsentSinceRef.current = now;
+    }
+
     if (now < cooldownUntilRef.current) return;
 
     if (hasHands) {
@@ -1048,6 +1162,13 @@ export default function App() {
         case 'S':
           handleScreenshot();
           break;
+        case 'E':
+          handleExportSentence();
+          break;
+        case 'BACKSPACE':
+          e.preventDefault();
+          handleDeleteLastWord();
+          break;
         case 'R':
           setActiveTab((prev) => (prev === 'live' ? 'record' : 'live'));
           break;
@@ -1080,7 +1201,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [currentSubtitle]);
+  }, [currentSubtitle, sentenceBuilder]);
 
   // 13. Recording Mode Handlers (Dataset Studio)
   const startRecordingFlow = () => {
@@ -1363,6 +1484,7 @@ export default function App() {
           <div className="flex items-center bg-slate-950/90 border border-slate-800 p-1 rounded-xl shadow-inner font-mono text-xs">
             <button
               onClick={() => setActiveTab('live')}
+              aria-pressed={activeTab === 'live'}
               className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg font-semibold transition-all ${
                 activeTab === 'live'
                   ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-md shadow-cyan-500/30'
@@ -1374,6 +1496,7 @@ export default function App() {
             </button>
             <button
               onClick={() => setActiveTab('record')}
+              aria-pressed={activeTab === 'record'}
               className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg font-semibold transition-all ${
                 activeTab === 'record'
                   ? 'bg-gradient-to-r from-rose-500 to-red-600 text-white shadow-md shadow-rose-500/30'
@@ -1702,16 +1825,11 @@ export default function App() {
           <div
             className={`absolute ${
               showHud ? 'bottom-11 sm:bottom-12' : 'bottom-3 sm:bottom-4'
-            } left-1/2 -translate-x-1/2 z-20 w-[92%] max-w-xl pointer-events-none transition-all duration-200`}
+            } left-1/2 -translate-x-1/2 z-20 w-[92%] max-w-3xl pointer-events-none transition-all duration-200`}
           >
             <div className="flex flex-col items-center">
               <div className="px-5 py-2.5 sm:px-6 sm:py-3 bg-black/85 backdrop-blur-xl rounded-2xl border border-cyan-500/30 shadow-2xl text-center transform transition-all pointer-events-auto">
                 <div className="flex items-center justify-center gap-2 mb-0.5">
-                  <Subtitles
-                    className={`w-3.5 h-3.5 ${
-                      activeTab === 'record' ? 'text-rose-400' : 'text-cyan-400'
-                    }`}
-                  />
                   <span
                     className={`text-[10px] font-mono font-bold tracking-wider uppercase ${
                       activeTab === 'record' ? 'text-rose-400' : 'text-cyan-400'
@@ -1731,7 +1849,15 @@ export default function App() {
                   )}
                 </div>
 
-                <div className="text-white text-lg sm:text-xl md:text-2xl font-black tracking-wide drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)]">
+                <div
+                  className={`text-white font-black tracking-wide drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)] ${
+                    captionSize === 'small'
+                      ? 'text-sm sm:text-base'
+                      : captionSize === 'large'
+                      ? 'text-xl sm:text-2xl md:text-3xl'
+                      : 'text-lg sm:text-xl md:text-2xl'
+                  }`}
+                >
                   {activeTab === 'record' ? (
                     recordingState === 'countdown' ? (
                       `Get ready to sign "${selectedWord}" in ${countdown}...`
@@ -1743,23 +1869,43 @@ export default function App() {
                       `Target: "${selectedWord}" (${currentWordCount} / ${TARGET_SAMPLES_PER_WORD} samples)`
                     )
                   ) : (
-                    <div
-                      className={`transition-opacity duration-700 ${
-                        isSubtitleFaded ? 'opacity-0' : 'opacity-100'
-                      }`}
-                    >
-                      {currentSubtitle ? (
-                        <span className="capitalize text-cyan-100">{currentSubtitle}</span>
-                      ) : (
-                        <span className="text-slate-400 text-xs sm:text-sm font-normal italic font-sans">
-                          {aiModelReady
-                            ? liveCollectingFrames > 0
-                              ? 'Signing gesture in progress...'
-                              : 'Subtitles will appear here (sign a word)'
-                            : 'Loading neural recognition model...'}
-                        </span>
+                    <>
+                      <div
+                        role="status"
+                        aria-live="polite"
+                        className={`transition-opacity duration-700 ${
+                          isSubtitleFaded ? 'opacity-0' : 'opacity-100'
+                        }`}
+                      >
+                        {currentSubtitle ? (
+                          <span className={`capitalize ${
+                            currentSubtitle === 'Uncertain - please repeat'
+                              ? 'text-slate-400 text-base font-semibold'
+                              : 'text-cyan-100'
+                          }`}>
+                            {currentSubtitle}
+                            {currentConfidence !== null && (
+                              <span className="ml-2 text-sm font-semibold text-cyan-300">
+                                {Math.round(currentConfidence * 100)}%
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 text-xs sm:text-sm font-normal italic font-sans">
+                            {aiModelReady
+                              ? liveCollectingFrames > 0
+                                ? 'Signing gesture in progress...'
+                                : 'Subtitles will appear here (sign a word)'
+                              : 'Loading neural recognition model...'}
+                          </span>
+                        )}
+                      </div>
+                      {sentenceText && (
+                        <p className="mt-1 max-w-full whitespace-normal break-words text-base sm:text-lg font-bold leading-snug text-white">
+                          {sentenceText}
+                        </p>
                       )}
-                    </div>
+                    </>
                   )}
                 </div>
               </div>
@@ -1800,6 +1946,7 @@ export default function App() {
             <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800">
               <button
                 onClick={() => setHandMode('both')}
+                aria-pressed={handMode === 'both'}
                 className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
                   handMode === 'both'
                     ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/50 shadow-sm'
@@ -1810,6 +1957,7 @@ export default function App() {
               </button>
               <button
                 onClick={() => setHandMode('right')}
+                aria-pressed={handMode === 'right'}
                 className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
                   handMode === 'right'
                     ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/50 shadow-sm'
@@ -1820,6 +1968,7 @@ export default function App() {
               </button>
               <button
                 onClick={() => setHandMode('left')}
+                aria-pressed={handMode === 'left'}
                 className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
                   handMode === 'left'
                     ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/50 shadow-sm'
@@ -1836,6 +1985,7 @@ export default function App() {
             {/* Ghost (Invisibility) Mode Toggle [G] */}
             <button
               onClick={() => setIsGhostMode(!isGhostMode)}
+              aria-pressed={isGhostMode}
               title="Toggle Ghost Mode [G]"
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border font-bold transition-all ${
                 isGhostMode
@@ -1850,6 +2000,7 @@ export default function App() {
             {/* HUD Overlay Toggle [H] */}
             <button
               onClick={() => setShowHud(!showHud)}
+              aria-pressed={showHud}
               title="Toggle HUD Overlay [H]"
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border font-bold transition-all ${
                 showHud
@@ -1864,6 +2015,7 @@ export default function App() {
             {/* Landmarks Toggle [L] */}
             <button
               onClick={() => setShowLandmarks(!showLandmarks)}
+              aria-pressed={showLandmarks}
               title="Toggle 21 Landmark Points [L]"
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border font-bold transition-all ${
                 showLandmarks
@@ -1878,6 +2030,7 @@ export default function App() {
             {/* Skeleton Toggle [K] */}
             <button
               onClick={() => setShowSkeleton(!showSkeleton)}
+              aria-pressed={showSkeleton}
               title="Toggle Skeleton Lines [K]"
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border font-bold transition-all ${
                 showSkeleton
@@ -1892,6 +2045,7 @@ export default function App() {
             {/* Pause Detection [P] */}
             <button
               onClick={() => setIsPaused(!isPaused)}
+              aria-pressed={isPaused}
               title="Pause / Resume Detection [P]"
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border font-bold transition-all ${
                 isPaused
@@ -1938,6 +2092,8 @@ export default function App() {
             {/* Mirror Toggle */}
             <button
               onClick={() => setIsMirrored(!isMirrored)}
+              aria-label="Toggle mirrored camera view"
+              aria-pressed={isMirrored}
               title="Toggle Mirror View"
               className={`p-2 rounded-xl border transition-colors ${
                 isMirrored
@@ -1947,6 +2103,64 @@ export default function App() {
             >
               <FlipHorizontal className="w-4 h-4" />
             </button>
+          </div>
+        </div>
+
+        {/* Accessible Sentence & Caption Controls */}
+        <div className="w-full max-w-4xl mt-2.5 p-3 bg-slate-900/80 backdrop-blur-xl border border-cyan-500/25 rounded-2xl shadow-xl font-mono text-xs">
+          <div className="flex flex-col md:flex-row md:items-center gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-cyan-400 font-bold uppercase tracking-wider">Recognized sentence</span>
+                <span className="text-slate-500">{sentenceText.length} characters</span>
+              </div>
+              <div
+                className="min-h-12 whitespace-pre-wrap px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-white text-lg font-bold leading-relaxed"
+              >
+                {sentenceBuilder.length > 0 ? sentenceBuilder.map((item, index) => (
+                  <React.Fragment key={`word-${index}`}>
+                    {index > 0 && ' '}
+                    <span>{item.word}</span>
+                    <span className="ml-1 text-sm font-semibold text-cyan-300">
+                      {Math.round(item.confidence * 100)}%
+                    </span>
+                  </React.Fragment>
+                )) : <span className="text-slate-500 italic">Recognized words will build a sentence here</span>}
+                {hasTrailingSpace && sentenceBuilder.length > 0 && ' '}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button onClick={handleInsertSpace} className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 hover:border-cyan-500 text-slate-300">Space</button>
+              <button onClick={handleDeleteLastWord} disabled={sentenceBuilder.length === 0} className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 hover:border-amber-500 text-slate-300 disabled:opacity-40">Delete</button>
+              <button onClick={handleCapitalizeSentence} disabled={sentenceBuilder.length === 0} className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 hover:border-cyan-500 text-slate-300 disabled:opacity-40">Capitalize</button>
+              <button onClick={handleClearSentence} disabled={sentenceBuilder.length === 0} className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 hover:border-red-500 text-slate-300 disabled:opacity-40">Clear sentence</button>
+              <button onClick={handleCopySentence} disabled={sentenceBuilder.length === 0} title="Copy the recognized sentence" className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 hover:border-cyan-500 text-slate-300 disabled:opacity-40">Copy sentence</button>
+              <button onClick={handleExportSentence} disabled={sentenceBuilder.length === 0} className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 hover:border-cyan-500 text-slate-300 disabled:opacity-40">Export</button>
+              <button
+                onClick={isSpeaking ? handleStopSpeaking : handleSpeakSentence}
+                disabled={sentenceBuilder.length === 0}
+                className={`px-2.5 py-1.5 rounded-lg border font-bold disabled:opacity-40 ${
+                  isSpeaking
+                    ? 'bg-rose-950 border-rose-600 text-rose-300'
+                    : 'bg-cyan-950/70 border-cyan-700 text-cyan-300'
+                }`}
+              >
+                {isSpeaking ? 'Stop speech' : 'Speak'}
+              </button>
+              <label className="flex items-center gap-1.5 text-slate-400">
+                Caption size
+                <select
+                  value={captionSize}
+                  onChange={(e) => setCaptionSize(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-slate-200"
+                >
+                  <option value="small">Small</option>
+                  <option value="medium">Medium</option>
+                  <option value="large">Large</option>
+                </select>
+              </label>
+            </div>
           </div>
         </div>
 
@@ -2088,6 +2302,7 @@ export default function App() {
                 <button
                   onClick={handleDeleteLastRecording}
                   disabled={recordingState !== 'idle' || totalRecordingsCount === 0}
+                  aria-label="Delete last recording"
                   title="Delete the most recent recording"
                   className="flex items-center gap-2 px-3.5 py-3 bg-slate-950 hover:bg-red-950/60 border border-slate-800 hover:border-red-600/60 text-slate-300 hover:text-red-300 rounded-xl text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
