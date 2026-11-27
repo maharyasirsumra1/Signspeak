@@ -25,6 +25,7 @@ import {
   Terminal,
   Save
 } from 'lucide-react';
+import { useAccount } from './components/AccountShell.jsx';
 import {
   VOCABULARY,
   TARGET_SAMPLES_PER_WORD,
@@ -82,6 +83,9 @@ const HAND_CONNECTIONS = [
 const FINGERTIPS = [4, 8, 12, 16, 20];
 
 export default function App() {
+  const { currentCall, sendSignal, setLocalVideoStream } = useAccount();
+  const currentCallRef = useRef(currentCall);
+  currentCallRef.current = currentCall;
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const landmarkerRef = useRef(null);
@@ -100,6 +104,8 @@ export default function App() {
   const [modelReady, setModelReady] = useState(false);
   const [cameraStatus, setCameraStatus] = useState('idle'); // idle | requesting | active | error
   const [errorMessage, setErrorMessage] = useState('');
+  const [cameraDevices, setCameraDevices] = useState([]);
+  const [selectedCameraId, setSelectedCameraId] = useState('');
   const [detectedHandsCount, setDetectedHandsCount] = useState(0);
   const [isMirrored, setIsMirrored] = useState(true);
   const isMirroredRef = useRef(isMirrored);
@@ -139,20 +145,11 @@ export default function App() {
     handModeRef.current = handMode;
   }, [handMode]);
 
-  // Ghost Mode (Invisibility of real webcam feed), persisted in localStorage
-  const [isGhostMode, setIsGhostMode] = useState(() => {
-    try {
-      return localStorage.getItem('signspeak_ghost_mode') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  // Ghost Mode is off by default so the webcam remains visible after a reload.
+  const [isGhostMode, setIsGhostMode] = useState(false);
   const isGhostModeRef = useRef(isGhostMode);
   useEffect(() => {
     isGhostModeRef.current = isGhostMode;
-    try {
-      localStorage.setItem('signspeak_ghost_mode', String(isGhostMode));
-    } catch {}
   }, [isGhostMode]);
 
   // Video Freeze / Pause
@@ -276,6 +273,39 @@ export default function App() {
     }, 3200);
   };
 
+  const refreshCameraDevices = async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+
+    try {
+      const devices = (await navigator.mediaDevices.enumerateDevices())
+        .filter((device) => device.kind === 'videoinput');
+      setCameraDevices(devices);
+      setSelectedCameraId((current) => {
+        const activeCameraId = streamRef.current
+          ?.getVideoTracks()[0]
+          ?.getSettings().deviceId;
+        if (current && devices.some((device) => device.deviceId === current)) {
+          return current;
+        }
+        return activeCameraId && devices.some((device) => device.deviceId === activeCameraId)
+          ? activeCameraId
+          : '';
+      });
+    } catch (err) {
+      console.error('Failed to enumerate cameras:', err);
+      showNotification('Unable to list available cameras.', 'error');
+    }
+  };
+
+  useEffect(() => {
+    refreshCameraDevices();
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return undefined;
+
+    mediaDevices.addEventListener('devicechange', refreshCameraDevices);
+    return () => mediaDevices.removeEventListener('devicechange', refreshCameraDevices);
+  }, []);
+
   // 3. Initialize Neural Recognition Model (/labels.json & /model_weights.json from public/)
   useEffect(() => {
     let isCancelled = false;
@@ -382,8 +412,15 @@ export default function App() {
     }
   }, [modelReady]);
 
-  const startCamera = async () => {
+  const startCamera = async (deviceId = selectedCameraId) => {
+    if (cameraStatus === 'requesting') return;
+
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera access is not supported by this browser.');
+      }
+
+      if (streamRef.current) stopCamera();
       setCameraStatus('requesting');
       setErrorMessage('');
 
@@ -391,20 +428,38 @@ export default function App() {
         video: {
           width: { ideal: 1280, max: 1920 },
           height: { ideal: 720, max: 1080 },
-          facingMode: 'user'
+          ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' })
         },
         audio: false
       });
 
       streamRef.current = stream;
+      setLocalVideoStream(stream);
+      const videoTrack = stream.getVideoTracks()[0];
+      const activeCameraId = videoTrack?.getSettings().deviceId;
+      if (activeCameraId) setSelectedCameraId(activeCameraId);
+      videoTrack?.addEventListener('ended', () => {
+        if (streamRef.current !== stream) return;
+        stopCamera();
+        setCameraStatus('error');
+        setErrorMessage('The camera disconnected. Reconnect it and select a camera to try again.');
+      }, { once: true });
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.onloadedmetadata = () => {
-          videoRef.current.play().then(() => {
+        videoRef.current.onloadedmetadata = async () => {
+          try {
+            await videoRef.current.play();
+            if (streamRef.current !== stream) return;
             setCameraStatus('active');
             startDetectionLoop();
-          });
+            await refreshCameraDevices();
+          } catch (err) {
+            if (streamRef.current !== stream) return;
+            console.error('Unable to start camera preview:', err);
+            setCameraStatus('error');
+            setErrorMessage(`Unable to play the camera preview: ${err.message}`);
+          }
         };
       }
     } catch (err) {
@@ -416,6 +471,10 @@ export default function App() {
         );
       } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
         setErrorMessage('No camera found on this device. Please connect a webcam.');
+      } else if (err.name === 'OverconstrainedError' && deviceId) {
+        setErrorMessage('That camera is unavailable. Select another camera and try again.');
+      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+        setErrorMessage('The camera is busy in another app. Close it and try again.');
       } else {
         setErrorMessage(`Camera error: ${err.message || 'Unable to access camera'}`);
       }
@@ -425,12 +484,16 @@ export default function App() {
   const stopCamera = () => {
     if (animFrameIdRef.current) {
       cancelAnimationFrame(animFrameIdRef.current);
+      animFrameIdRef.current = null;
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+      setLocalVideoStream(null);
     }
     if (videoRef.current) {
+      videoRef.current.onloadedmetadata = null;
+      videoRef.current.pause();
       videoRef.current.srcObject = null;
     }
     if (canvasRef.current) {
@@ -439,8 +502,15 @@ export default function App() {
     }
     latestLandmarkerResultRef.current = null;
     setCameraStatus('idle');
+    setErrorMessage('');
     setDetectedHandsCount(0);
     setFps(0);
+    setLiveCollectingFrames(0);
+    isCollectingRef.current = false;
+    collectedFramesRef.current = [];
+    gestureStartTimeRef.current = null;
+    noHandsStartTimeRef.current = null;
+    prevWristCoordsRef.current = null;
   };
 
   // 6. Draw Hand Landmarks & Skeleton Lines
@@ -834,6 +904,18 @@ export default function App() {
 
       if (top1 && top1.confidence >= ACCEPT_CONFIDENCE) {
         showRecognizedWord(top1.word, top1.confidence);
+        const activeCall = currentCallRef.current;
+        if (activeCall && ['connecting', 'connected'].includes(activeCall.status)) {
+          try {
+            sendSignal('caption', {
+              callId: activeCall.callId,
+              text: top1.word,
+              source: 'sign'
+            });
+          } catch (error) {
+            showNotification(error.message, 'error');
+          }
+        }
       } else if (top1) {
         setIsSubtitleFaded(false);
         setCurrentSubtitle('Uncertain - please repeat');
@@ -1198,7 +1280,12 @@ export default function App() {
           break;
         case 'G':
           setIsGhostMode((prev) => !prev);
-          showNotification(isGhostModeRef.current ? 'Ghost mode OFF' : 'Ghost invisibility ON', 'success');
+          showNotification(
+            isGhostModeRef.current
+              ? 'Grid preview OFF — camera visible'
+              : 'Grid preview ON — camera hidden',
+            'info'
+          );
           break;
         default:
           break;
@@ -1593,7 +1680,7 @@ export default function App() {
               : 'border-cyan-500/30 shadow-cyan-950/30'
           }`}
         >
-          {/* Cyber Holographic Grid for Ghost Mode */}
+          {/* Grid preview replaces the webcam feed while enabled. */}
           <div
             className={`absolute inset-0 pointer-events-none transition-opacity duration-500 ${
               isGhostMode ? 'opacity-100' : 'opacity-0'
@@ -1643,7 +1730,7 @@ export default function App() {
             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
               <div className="flex items-center gap-2 px-3.5 py-1 rounded-full bg-cyan-950/80 backdrop-blur-md border border-cyan-400/60 text-cyan-300 font-mono text-[11px] font-bold shadow-lg shadow-cyan-950/50">
                 <Sparkles className="w-3.5 h-3.5 text-cyan-400 animate-spin" />
-                <span>GHOST INVISIBILITY ACTIVE</span>
+                <span>GRID PREVIEW ACTIVE — CAMERA HIDDEN</span>
               </div>
             </div>
           )}
@@ -1861,7 +1948,7 @@ export default function App() {
                     className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-mono font-bold rounded-xl shadow-lg shadow-cyan-500/25 transition-all transform hover:scale-105 active:scale-95 disabled:opacity-50 cursor-pointer pointer-events-auto"
                   >
                     <Video className="w-4 h-4" />
-                    <span>Initialize Camera</span>
+                    <span>{cameraStatus === 'requesting' ? 'Starting Camera...' : 'Initialize Camera'}</span>
                   </button>
                 </div>
               )}
@@ -1979,7 +2066,7 @@ export default function App() {
                 <span>•</span>
                 <span><span className="text-cyan-400 font-bold">[X]</span> Copy</span>
                 <span>•</span>
-                <span><span className="text-cyan-400 font-bold">[G]</span> Ghost</span>
+                <span><span className="text-cyan-400 font-bold">[G]</span> Grid preview</span>
               </div>
             </div>
           )}
@@ -1987,6 +2074,74 @@ export default function App() {
 
         {/* MODULAR CONTROL DECK (Below Video Stage) */}
         <div className="w-full max-w-4xl mt-3 p-3 bg-slate-900/80 backdrop-blur-xl border border-cyan-500/25 rounded-2xl shadow-xl flex flex-wrap items-center justify-between gap-3 font-mono text-xs">
+          <div className="w-full flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-2 text-slate-400">
+              <Video className="w-4 h-4 text-cyan-400" />
+              <span>Camera:</span>
+              <select
+                aria-label="Select camera"
+                value={selectedCameraId}
+                disabled={cameraStatus === 'requesting' || cameraDevices.length === 0}
+                onChange={(event) => {
+                  const deviceId = event.target.value;
+                  setSelectedCameraId(deviceId);
+                  if (cameraStatus === 'active') startCamera(deviceId);
+                }}
+                className="max-w-[220px] bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200 disabled:opacity-50"
+              >
+                <option value="">System default</option>
+                {cameraDevices.map((device, index) => (
+                  <option key={device.deviceId || `camera-${index}`} value={device.deviceId}>
+                    {device.label || `Camera ${index + 1}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <span
+              role="status"
+              aria-live="polite"
+              className={`rounded-full border px-2.5 py-1 font-bold ${
+                cameraStatus === 'active'
+                  ? 'border-emerald-700 bg-emerald-950/60 text-emerald-300'
+                  : cameraStatus === 'error'
+                  ? 'border-red-700 bg-red-950/60 text-red-300'
+                  : 'border-slate-700 bg-slate-950 text-slate-400'
+              }`}
+            >
+              {cameraStatus === 'active'
+                ? 'Camera on'
+                : cameraStatus === 'requesting'
+                ? 'Starting camera...'
+                : cameraStatus === 'error'
+                ? 'Camera error'
+                : 'Camera off'}
+            </span>
+            <button
+              onClick={cameraStatus === 'active' ? stopCamera : () => startCamera()}
+              disabled={modelLoading || cameraStatus === 'requesting' || recordingState !== 'idle'}
+              aria-label={cameraStatus === 'active' ? 'Turn camera off' : 'Turn camera on'}
+              aria-pressed={cameraStatus === 'active'}
+              className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 font-bold transition-colors disabled:opacity-50 ${
+                cameraStatus === 'active'
+                  ? 'border-red-800 bg-red-950/60 text-red-300 hover:border-red-500'
+                  : 'border-cyan-800 bg-cyan-950/60 text-cyan-300 hover:border-cyan-500'
+              }`}
+            >
+              {cameraStatus === 'active'
+                ? <VideoOff className="w-3.5 h-3.5" />
+                : <Video className="w-3.5 h-3.5" />}
+              <span>{cameraStatus === 'active' ? 'Turn camera off' : 'Turn camera on'}</span>
+            </button>
+            {aiModelReady && (
+              <span
+                className="ml-auto text-[10px] text-slate-500"
+                title="This model only recognizes the labels listed in the loaded vocabulary."
+              >
+                {labelsRef.current.length} supported signs · A–Z not yet supported
+              </span>
+            )}
+          </div>
+
           {/* Hand Mode Segmented Control (Requirement D) */}
           <div className="flex items-center gap-2">
             <span className="text-slate-400 text-[11px] uppercase tracking-wider font-bold">Hand Mode:</span>
@@ -2029,11 +2184,12 @@ export default function App() {
 
           {/* Interactive Button Deck for All Shortcuts */}
           <div className="flex flex-wrap items-center gap-2">
-            {/* Ghost (Invisibility) Mode Toggle [G] */}
+            {/* Grid preview toggle [G] */}
             <button
               onClick={() => setIsGhostMode(!isGhostMode)}
               aria-pressed={isGhostMode}
-              title="Toggle Ghost Mode [G]"
+              aria-label="Toggle grid preview; this hides the camera feed"
+              title="Grid preview hides the camera feed [G]"
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border font-bold transition-all ${
                 isGhostMode
                   ? 'bg-cyan-950 text-cyan-300 border-cyan-400 shadow-md shadow-cyan-500/30 ring-1 ring-cyan-400/50'
@@ -2041,7 +2197,7 @@ export default function App() {
               }`}
             >
               <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Ghost [G]</span>
+              <span>Grid preview [G]</span>
             </button>
 
             {/* HUD Overlay Toggle [H] */}
