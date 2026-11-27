@@ -38,6 +38,23 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
 
+  CREATE TABLE IF NOT EXISTS google_identities (
+    google_subject TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS external_identities (
+    provider TEXT NOT NULL CHECK (provider IN ('google', 'facebook')),
+    subject TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(provider, subject),
+    UNIQUE(provider, user_id)
+  );
+  INSERT OR IGNORE INTO external_identities(provider, subject, user_id, created_at)
+    SELECT 'google', google_subject, user_id, created_at FROM google_identities;
+
   CREATE TABLE IF NOT EXISTS contacts (
     id TEXT PRIMARY KEY,
     requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -1,4 +1,7 @@
+import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+
+if (existsSync('.env')) process.loadEnvFile('.env');
 
 const children = [
   spawn(process.execPath, ['server/index.js'], { stdio: 'inherit' }),

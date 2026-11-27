@@ -1,7 +1,81 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, LogOut, Phone, UserPlus, X } from 'lucide-react';
+import SignSpeakFlowers from './SignSpeakFlowers.jsx';
+import './SignSpeakLogin.css';
 
 const AccountContext = createContext(null);
+let googleScriptPromise;
+let facebookScriptPromise;
+let facebookSdkAppId = '';
+
+function loadGoogleIdentityScript() {
+  if (window.google?.accounts?.id) return Promise.resolve();
+  if (!googleScriptPromise) {
+    googleScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://accounts.google.com/gsi/client';
+      script.async = true;
+      script.defer = true;
+      script.onload = () => {
+        if (window.google?.accounts?.id) resolve();
+        else {
+          googleScriptPromise = null;
+          reject(new Error('Google sign-in could not be loaded. Please try again.'));
+        }
+      };
+      script.onerror = () => {
+        googleScriptPromise = null;
+        reject(new Error('Google sign-in could not be loaded. Check your internet connection.'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return googleScriptPromise;
+}
+
+function loadFacebookSdk(appId) {
+  if (window.FB?.login) {
+    if (facebookSdkAppId !== appId) {
+      return initializeFacebookSdk(appId);
+    }
+    return Promise.resolve();
+  }
+  if (!facebookScriptPromise) {
+    facebookScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://connect.facebook.net/en_US/sdk.js';
+      script.async = true;
+      script.defer = true;
+      script.onload = () => {
+        if (window.FB?.login) {
+          initializeFacebookSdk(appId).then(resolve).catch((error) => {
+            facebookScriptPromise = null;
+            reject(error);
+          });
+        } else {
+          facebookScriptPromise = null;
+          reject(new Error('Facebook sign-in could not be loaded. Please try again.'));
+        }
+      };
+      script.onerror = () => {
+        facebookScriptPromise = null;
+        reject(new Error('Facebook sign-in could not be loaded. Check your internet connection.'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return facebookScriptPromise;
+}
+
+function initializeFacebookSdk(appId) {
+  try {
+    window.FB.init({ appId, cookie: true, xfbml: false, version: 'v27.0' });
+    facebookSdkAppId = appId;
+    return Promise.resolve();
+  } catch {
+    return Promise.reject(new Error('Facebook sign-in could not be initialized. Check your app settings.'));
+  }
+}
 
 export function useAccount() {
   const context = useContext(AccountContext);
@@ -32,8 +106,12 @@ export default function AccountShell({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState('');
+  const [providerNotice, setProviderNotice] = useState('');
   const [authMode, setAuthMode] = useState('login');
   const [verificationUrl, setVerificationUrl] = useState('');
+  const [verificationEmail, setVerificationEmail] = useState('');
+  const [googleClientId, setGoogleClientId] = useState(null);
+  const [facebookAppId, setFacebookAppId] = useState(null);
   const [contacts, setContacts] = useState([]);
   const [calls, setCalls] = useState([]);
   const [showContacts, setShowContacts] = useState(false);
@@ -46,6 +124,126 @@ export default function AccountShell({ children }) {
   const reconnectTimerRef = useRef(null);
   const signalListenersRef = useRef(new Set());
   const verificationStartedRef = useRef(false);
+  const googleButtonRef = useRef(null);
+
+  const handleFacebookAccessToken = useCallback(async (accessToken) => {
+    setAuthError('');
+    setProviderNotice('');
+    try {
+      const result = await apiRequest('/api/auth/facebook', {
+        method: 'POST',
+        body: JSON.stringify({ accessToken })
+      });
+      setUser(result.user);
+    } catch (error) {
+      setAuthError(error.message);
+    }
+  }, []);
+
+  const startFacebookSignIn = useCallback(() => {
+    if (!facebookAppId) {
+      setProviderNotice(
+        facebookAppId === null
+          ? 'Facebook sign-in is loading.'
+          : 'Facebook sign-in needs setup. See SOCIAL_SIGN_IN.md.'
+      );
+      return;
+    }
+    if (!window.FB?.login) {
+      setProviderNotice('Facebook sign-in is loading. Try again shortly.');
+      return;
+    }
+    try {
+      window.FB.login((result) => {
+        const accessToken = result?.authResponse?.accessToken;
+        if (!accessToken) {
+          setProviderNotice('Facebook sign-in was cancelled.');
+          return;
+        }
+        void handleFacebookAccessToken(accessToken);
+      }, { scope: 'public_profile,email' });
+    } catch {
+      setProviderNotice('Facebook sign-in could not start. Check your app settings.');
+    }
+  }, [facebookAppId, handleFacebookAccessToken]);
+
+  const handleGoogleCredential = useCallback(async ({ credential }) => {
+    if (!credential) {
+      setProviderNotice('Google sign-in did not complete. Please try again.');
+      return;
+    }
+    setAuthError('');
+    setProviderNotice('');
+    try {
+      const result = await apiRequest('/api/auth/google', {
+        method: 'POST',
+        body: JSON.stringify({ credential })
+      });
+      setUser(result.user);
+    } catch (error) {
+      setAuthError(error.message);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    apiRequest('/api/auth/social/config')
+      .then(({ googleClientId: clientId, facebookAppId: appId }) => {
+        if (active) {
+          setGoogleClientId(clientId || '');
+          setFacebookAppId(appId || '');
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setGoogleClientId('');
+          setFacebookAppId('');
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const container = googleButtonRef.current;
+    if (authMode !== 'login' || !googleClientId || !container) return undefined;
+    let active = true;
+    loadGoogleIdentityScript()
+      .then(() => {
+        if (!active || !container.isConnected) return;
+        window.google.accounts.id.initialize({
+          client_id: googleClientId,
+          callback: handleGoogleCredential
+        });
+        window.google.accounts.id.renderButton(container, {
+          type: 'standard',
+          theme: 'outline',
+          size: 'medium',
+          text: 'signin_with',
+          shape: 'rectangular',
+          width: 120
+        });
+      })
+      .catch((error) => {
+        if (active) setAuthError(error.message);
+      });
+    return () => {
+      active = false;
+      container.replaceChildren();
+    };
+  }, [loading, authMode, googleClientId, handleGoogleCredential]);
+
+  useEffect(() => {
+    if (loading || authMode !== 'login' || !facebookAppId) return undefined;
+    let active = true;
+    loadFacebookSdk(facebookAppId).catch((error) => {
+      if (active) setAuthError(error.message);
+    });
+    return () => {
+      active = false;
+    };
+  }, [loading, authMode, facebookAppId]);
 
   const loadContacts = useCallback(async () => {
     const result = await apiRequest('/api/contacts');
@@ -57,6 +255,21 @@ export default function AccountShell({ children }) {
     setCalls(result.calls);
   }, []);
 
+  const resendVerification = async () => {
+    setAuthError('');
+    setVerificationUrl('');
+    try {
+      const result = await apiRequest('/api/auth/verification/resend', {
+        method: 'POST',
+        body: JSON.stringify({ email: verificationEmail })
+      });
+      setAuthError(result.message);
+      setVerificationUrl(result.developmentVerificationUrl || '');
+    } catch (error) {
+      setAuthError(error.message);
+    }
+  };
+
   useEffect(() => {
     const query = new URLSearchParams(window.location.search);
     const verificationToken = query.get('verify');
@@ -67,6 +280,8 @@ export default function AccountShell({ children }) {
         .then((result) => {
           setAuthError(result.message);
           setAuthMode('login');
+          setVerificationEmail('');
+          if (result.user) setUser(result.user);
           window.history.replaceState({}, '', window.location.pathname);
         })
         .catch((error) => setAuthError(error.message))
@@ -168,7 +383,9 @@ export default function AccountShell({ children }) {
   const submitAuth = async (event) => {
     event.preventDefault();
     setAuthError('');
+    setProviderNotice('');
     setVerificationUrl('');
+    setVerificationEmail('');
     const data = new FormData(event.currentTarget);
     const payload = {
       displayName: data.get('displayName'),
@@ -183,6 +400,7 @@ export default function AccountShell({ children }) {
         });
         setAuthError(result.message);
         setVerificationUrl(result.developmentVerificationUrl || '');
+        setVerificationEmail(String(payload.email).trim().toLowerCase());
         setAuthMode('login');
       } else {
         const result = await apiRequest('/api/auth/login', {
@@ -193,6 +411,9 @@ export default function AccountShell({ children }) {
       }
     } catch (error) {
       setAuthError(error.message);
+      if (authMode === 'login' && error.message === 'Verify your email before signing in.') {
+        setVerificationEmail(String(payload.email).trim().toLowerCase());
+      }
     }
   };
 
@@ -202,6 +423,10 @@ export default function AccountShell({ children }) {
       await apiRequest('/api/auth/logout', { method: 'POST' });
       setUser(null);
       setContacts([]);
+      setAuthError('');
+      setProviderNotice('');
+      setVerificationUrl('');
+      setVerificationEmail('');
     } catch (error) {
       setAuthError(error.message);
     }
@@ -231,53 +456,160 @@ export default function AccountShell({ children }) {
 
   if (!user) {
     return (
-      <main className="min-h-screen grid place-items-center bg-slate-950 px-4 text-slate-100">
-        <form onSubmit={submitAuth} className="w-full max-w-md space-y-4 rounded-2xl border border-cyan-700/50 bg-slate-900 p-6 shadow-2xl">
-          <div>
-            <h1 className="text-2xl font-black text-cyan-200">SignSpeak account</h1>
-            <p className="mt-1 text-sm text-slate-400">
-              Sign in to manage verified contacts and private calls.
-            </p>
-          </div>
-          {authMode === 'register' && (
-            <label className="block text-sm text-slate-300">
-              Display name
-              <input name="displayName" required minLength={2} maxLength={80} autoComplete="name" className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-            </label>
-          )}
-          <label className="block text-sm text-slate-300">
-            Email
-            <input name="email" type="email" required maxLength={254} autoComplete="email" className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-          </label>
-          <label className="block text-sm text-slate-300">
-            Password (at least 12 characters)
-            <input name="password" type="password" required minLength={12} maxLength={128} autoComplete={authMode === 'register' ? 'new-password' : 'current-password'} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-          </label>
-          {authError && (
-            <p role="status" aria-live="polite" className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 text-sm text-amber-200">
-              {authError}
-            </p>
-          )}
-          {verificationUrl && (
-            <a className="block rounded-lg border border-cyan-700 p-3 text-sm text-cyan-200 underline" href={verificationUrl}>
-              Verify local development email
-            </a>
-          )}
-          <button type="submit" className="w-full rounded-lg bg-cyan-600 px-4 py-2.5 font-bold text-white hover:bg-cyan-500">
-            {authMode === 'register' ? 'Create account' : 'Sign in'}
-          </button>
-          <button
-            type="button"
-            className="w-full text-sm text-slate-300 underline"
-            onClick={() => {
-              setAuthError('');
-              setVerificationUrl('');
-              setAuthMode(authMode === 'login' ? 'register' : 'login');
-            }}
+      <main className="auth-screen">
+        <div className="auth-page">
+          <aside className="login-sidebar" aria-label="SignSpeak">
+            <span>SignSpeak</span>
+          </aside>
+
+          <div className="login-background-circle login-circle-a" aria-hidden="true" />
+          <div className="login-background-circle login-circle-b" aria-hidden="true" />
+          <div className="login-background-circle login-circle-c" aria-hidden="true" />
+
+          {Array.from({ length: 12 }, (_, index) => (
+            <span
+              key={index}
+              className={`login-dot login-dot-${index + 1}`}
+              aria-hidden="true"
+            />
+          ))}
+
+          <form
+            onSubmit={submitAuth}
+            aria-labelledby="auth-heading"
+            className={`login-card${authMode === 'register' ? ' login-card--register' : ''}`}
           >
-            {authMode === 'login' ? 'Create an account' : 'Back to sign in'}
-          </button>
-        </form>
+            <h1 id="auth-heading" className="login-title">
+              {authMode === 'register' ? 'Create Account' : 'Login Now'}
+            </h1>
+
+            {authMode === 'register' && (
+              <input
+                className="login-field"
+                name="displayName"
+                type="text"
+                placeholder="Your name"
+                aria-label="Display name"
+                autoComplete="name"
+                minLength={2}
+                maxLength={80}
+                required
+              />
+            )}
+
+            <input
+              className="login-field"
+              name="email"
+              type="email"
+              placeholder="Email address"
+              aria-label="Email address"
+              autoComplete="email"
+              maxLength={254}
+              onChange={(event) => {
+                const enteredEmail = event.currentTarget.value.trim().toLowerCase();
+                setVerificationEmail((currentEmail) => (
+                  currentEmail && currentEmail !== enteredEmail ? '' : currentEmail
+                ));
+              }}
+              required
+            />
+
+            <input
+              className="login-field"
+              name="password"
+              type="password"
+              placeholder="Password"
+              aria-label="Password"
+              autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
+              minLength={authMode === 'register' ? 6 : undefined}
+              maxLength={128}
+              required
+            />
+            {authMode === 'register' && (
+              <span className="login-password-hint">
+                Use at least 6 characters: letters, digits, or both (up to 128).
+              </span>
+            )}
+
+            {authError && (
+              <p role="status" aria-live="polite" className="login-error">
+                {authError}
+              </p>
+            )}
+            {verificationEmail && authMode === 'login' && (
+              <button
+                className="login-resend-verification"
+                type="button"
+                onClick={resendVerification}
+              >
+                Resend verification link
+              </button>
+            )}
+            {verificationUrl && (
+              <a className="login-verification-link" href={verificationUrl}>
+                Open verification link (development)
+              </a>
+            )}
+
+            <button className="login-btn" type="submit">
+              {authMode === 'register' ? 'SIGN UP' : 'LOGIN'}
+            </button>
+
+            {authMode === 'login' && (
+              <>
+                <div className="login-or">Or login with</div>
+                <div className="login-socials">
+                  <button
+                    className="login-social login-social-facebook"
+                    type="button"
+                    onClick={startFacebookSignIn}
+                  >
+                    <span className="login-social-icon login-facebook-icon" aria-hidden="true">f</span>
+                    Facebook
+                  </button>
+                  {googleClientId ? (
+                    <div className="login-google-slot" ref={googleButtonRef} />
+                  ) : (
+                    <button
+                      className="login-social login-social-google"
+                      type="button"
+                      onClick={() => setProviderNotice(
+                        googleClientId === null
+                          ? 'Google sign-in is loading.'
+                          : 'Google sign-in needs setup. See SOCIAL_SIGN_IN.md.'
+                      )}
+                    >
+                      <span className="login-social-icon login-google-icon" aria-hidden="true">G</span>
+                      Google
+                    </button>
+                  )}
+                </div>
+                {providerNotice && (
+                  <p role="status" className="login-provider-notice">
+                    {providerNotice}
+                  </p>
+                )}
+              </>
+            )}
+
+            <div className="login-member">
+              {authMode === 'login' ? 'Not a member?' : 'Already have an account?'}{' '}
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthError('');
+                  setProviderNotice('');
+                  setVerificationUrl('');
+                  setAuthMode(authMode === 'login' ? 'register' : 'login');
+                }}
+              >
+                {authMode === 'login' ? 'Signup now' : 'Sign in'}
+              </button>
+            </div>
+          </form>
+
+          <SignSpeakFlowers />
+        </div>
       </main>
     );
   }

@@ -6,6 +6,8 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { db as defaultDatabase } from './db.js';
+import { verifyFacebookAccessToken } from './facebook-auth.js';
+import { verifyGoogleIdToken } from './google-auth.js';
 import { sendVerificationEmail } from './mailer.js';
 import { createToken, hashPassword, hashToken, verifyPassword } from './security.js';
 
@@ -19,7 +21,12 @@ const socketsByUser = new Map();
 export function createSignSpeakServer({
   database = defaultDatabase,
   host = process.env.HOST || '127.0.0.1',
-  port = Number(process.env.PORT || 3001)
+  port = Number(process.env.PORT || 3001),
+  googleClientId = process.env.GOOGLE_CLIENT_ID || '',
+  googleTokenVerifier = verifyGoogleIdToken,
+  facebookAppId = process.env.FACEBOOK_APP_ID || '',
+  facebookAppSecret = process.env.FACEBOOK_APP_SECRET || '',
+  facebookTokenVerifier = verifyFacebookAccessToken
 } = {}) {
   const isTls = Boolean(process.env.TLS_CERT_PATH && process.env.TLS_KEY_PATH);
   const server = isTls
@@ -106,8 +113,14 @@ export function createSignSpeakServer({
       response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
 
-    void routeRequest(request, response, database, isTls).catch((error) => {
-      console.error('SignSpeak API error:', error);
+    void routeRequest(
+      request,
+      response,
+      database,
+      isTls,
+      { googleClientId, googleTokenVerifier, facebookAppId, facebookAppSecret, facebookTokenVerifier }
+    ).catch((error) => {
+      if (!error.status || error.status >= 500) console.error('SignSpeak API error:', error);
       if (!response.headersSent) {
         json(response, error.status || 500, {
           error: error.status ? error.message : 'The request could not be completed.'
@@ -153,13 +166,20 @@ export function createSignSpeakServer({
   };
 }
 
-async function routeRequest(request, response, database, isTls) {
+async function routeRequest(request, response, database, isTls, providers) {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
   const { pathname } = url;
   const method = request.method || 'GET';
 
   if (method === 'GET' && pathname === '/api/health') {
     json(response, 200, { status: 'ok' });
+    return;
+  }
+  if (method === 'GET' && pathname === '/api/auth/social/config') {
+    json(response, 200, {
+      googleClientId: providers.googleClientId || null,
+      facebookAppId: providers.facebookAppId || null
+    });
     return;
   }
 
@@ -171,13 +191,40 @@ async function routeRequest(request, response, database, isTls) {
     await register(request, response, database, url);
     return;
   }
+  if (method === 'POST' && pathname === '/api/auth/verification/resend') {
+    enforceRateLimit(request, 'verification-resend', 5);
+    await resendVerification(request, response, database, url);
+    return;
+  }
   if (method === 'GET' && pathname === '/api/auth/verify') {
-    verifyEmail(response, database, url);
+    verifyEmail(response, database, url, isTls);
     return;
   }
   if (method === 'POST' && pathname === '/api/auth/login') {
     enforceRateLimit(request, 'login', 10);
     await login(request, response, database, isTls);
+    return;
+  }
+  if (method === 'POST' && pathname === '/api/auth/google') {
+    enforceRateLimit(request, 'google-login', 10);
+    if (!providers.googleClientId) throw httpError(503, 'Google sign-in is not configured. Set GOOGLE_CLIENT_ID in .env.');
+    await loginWithGoogle(request, response, database, isTls, providers.googleClientId, providers.googleTokenVerifier);
+    return;
+  }
+  if (method === 'POST' && pathname === '/api/auth/facebook') {
+    enforceRateLimit(request, 'facebook-login', 10);
+    if (!providers.facebookAppId || !providers.facebookAppSecret) {
+      throw httpError(503, 'Facebook sign-in is not configured. Set FACEBOOK_APP_ID and FACEBOOK_APP_SECRET in .env.');
+    }
+    await loginWithFacebook(
+      request,
+      response,
+      database,
+      isTls,
+      providers.facebookAppId,
+      providers.facebookAppSecret,
+      providers.facebookTokenVerifier
+    );
     return;
   }
   if (method === 'GET' && pathname === '/api/auth/me') {
@@ -312,8 +359,8 @@ async function register(request, response, database, requestUrl) {
     throw httpError(400, 'Enter a valid email address.');
   }
   if (!displayName) throw httpError(400, 'Display name must be between 2 and 80 characters.');
-  if (password.length < 12 || password.length > 128) {
-    throw httpError(400, 'Password must be between 12 and 128 characters.');
+  if (password.length < 6 || password.length > 128) {
+    throw httpError(400, 'Password must be between 6 and 128 characters.');
   }
   if (database.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
     throw httpError(409, 'An account with this email already exists.');
@@ -353,7 +400,52 @@ async function register(request, response, database, requestUrl) {
   }
 }
 
-function verifyEmail(response, database, url) {
+async function resendVerification(request, response, database, requestUrl) {
+  const body = await readJson(request);
+  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    throw httpError(400, 'Enter a valid email address.');
+  }
+
+  const user = database.prepare(`
+    SELECT id, email, display_name, email_verified_at FROM users WHERE email = ?
+  `).get(email);
+  const message = 'If an unverified account exists for this email, a verification link has been sent.';
+  if (!user || user.email_verified_at) {
+    json(response, 200, { message });
+    return;
+  }
+
+  const token = createToken();
+  const now = Date.now();
+  const origin = process.env.PUBLIC_ORIGIN || requestUrl.origin;
+  const verificationUrl = new URL('/', origin);
+  verificationUrl.searchParams.set('verify', token);
+
+  let mailResult;
+  try {
+    mailResult = await sendVerificationEmail({
+      email: user.email,
+      displayName: user.display_name,
+      verificationUrl: verificationUrl.toString()
+    });
+  } catch {
+    throw httpError(503, 'Verification email could not be sent. Please try again later.');
+  }
+
+  runTransaction(database, () => {
+    database.prepare('DELETE FROM email_verifications WHERE user_id = ?').run(user.id);
+    database.prepare(`
+      INSERT INTO email_verifications(token_hash, user_id, expires_at) VALUES (?, ?, ?)
+    `).run(hashToken(token), user.id, now + VERIFY_TTL_MS);
+  });
+  json(response, 200, {
+    message,
+    ...(mailResult.developmentUrl ? { developmentVerificationUrl: mailResult.developmentUrl } : {})
+  });
+}
+
+function verifyEmail(response, database, url, isTls) {
   const token = url.searchParams.get('token') || '';
   if (token.length < 32 || token.length > 128) throw httpError(400, 'Verification link is invalid or expired.');
   const verification = database.prepare(`
@@ -364,7 +456,8 @@ function verifyEmail(response, database, url) {
     database.prepare('UPDATE users SET email_verified_at = ? WHERE id = ?').run(Date.now(), verification.user_id);
     database.prepare('DELETE FROM email_verifications WHERE user_id = ?').run(verification.user_id);
   });
-  json(response, 200, { message: 'Email verified. You can now sign in.' });
+  const user = establishSession(response, database, verification.user_id, isTls);
+  json(response, 200, { message: 'Email verified. You are now signed in.', user });
 }
 
 async function login(request, response, database, isTls) {
@@ -376,13 +469,105 @@ async function login(request, response, database, isTls) {
   if (!validPassword) throw httpError(401, 'Email or password is incorrect.');
   if (!user.email_verified_at) throw httpError(403, 'Verify your email before signing in.');
 
+  createSession(response, database, user.id, isTls);
+}
+
+async function loginWithGoogle(request, response, database, isTls, clientId, tokenVerifier) {
+  const body = await readJson(request);
+  if (!body || typeof body !== 'object' || typeof body.credential !== 'string') {
+    throw httpError(400, 'Google sign-in credential is required.');
+  }
+
+  const identity = await tokenVerifier(body.credential, clientId);
+  await loginWithExternalIdentity(response, database, isTls, 'google', identity);
+}
+
+async function loginWithFacebook(request, response, database, isTls, appId, appSecret, tokenVerifier) {
+  const body = await readJson(request);
+  if (!body || typeof body !== 'object' || typeof body.accessToken !== 'string') {
+    throw httpError(400, 'Facebook sign-in token is required.');
+  }
+  const identity = await tokenVerifier(body.accessToken, appId, appSecret);
+  await loginWithExternalIdentity(response, database, isTls, 'facebook', identity);
+}
+
+async function loginWithExternalIdentity(response, database, isTls, provider, identity) {
+  if (
+    !identity
+    || typeof identity.subject !== 'string'
+    || identity.subject.length > 255
+    || typeof identity.email !== 'string'
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identity.email)
+    || identity.email.length > 254
+  ) {
+    throw httpError(401, `${provider} sign-in could not be verified. Please try again.`);
+  }
+
+  const normalizedEmail = identity.email.trim().toLowerCase();
+  const linkedIdentity = database.prepare(
+    'SELECT user_id FROM external_identities WHERE provider = ? AND subject = ?'
+  ).get(provider, identity.subject);
+  const existingEmail = database.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
+  const passwordHash = !linkedIdentity && !existingEmail
+    ? await hashPassword(createToken())
+    : null;
+  const now = Date.now();
+  let userId = linkedIdentity?.user_id || null;
+
+  if (!linkedIdentity) {
+    try {
+      runTransaction(database, () => {
+        const linkedInTransaction = database.prepare(
+          'SELECT user_id FROM external_identities WHERE provider = ? AND subject = ?'
+        ).get(provider, identity.subject);
+        const existingInTransaction = database.prepare('SELECT id FROM users WHERE email = ?')
+          .get(normalizedEmail);
+        userId = linkedInTransaction?.user_id || existingInTransaction?.id || randomUUID();
+
+        if (!existingInTransaction && !linkedInTransaction) {
+          const localPart = normalizedEmail.split('@')[0];
+          const displayName = cleanText(identity.displayName, 2, 80)
+            || cleanText(localPart, 2, 80)
+            || `${provider === 'facebook' ? 'Facebook' : 'Google'} user`;
+          database.prepare(`
+            INSERT INTO users(id, email, display_name, password_hash, email_verified_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).run(userId, normalizedEmail, displayName, passwordHash, now, now);
+        } else {
+          database.prepare('UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?')
+            .run(now, userId);
+        }
+
+        if (!linkedInTransaction) {
+          database.prepare(`
+            INSERT INTO external_identities(provider, subject, user_id, created_at) VALUES (?, ?, ?, ?)
+          `).run(provider, identity.subject, userId, now);
+        }
+      });
+    } catch (error) {
+      if (error.code === 'ERR_SQLITE_CONSTRAINT_UNIQUE' || error.code === 'ERR_SQLITE_CONSTRAINT_PRIMARYKEY') {
+        throw httpError(409, `This ${provider} account is already linked to another SignSpeak account.`);
+      }
+      throw error;
+    }
+  }
+
+  createSession(response, database, userId, isTls);
+}
+
+function createSession(response, database, userId, isTls) {
+  const user = establishSession(response, database, userId, isTls);
+  json(response, 200, { user });
+}
+
+function establishSession(response, database, userId, isTls) {
   const token = createToken();
   const createdAt = Date.now();
   const expiresAt = createdAt + SESSION_TTL_MS;
   database.prepare('INSERT INTO sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
-    .run(hashToken(token), user.id, createdAt, expiresAt);
+    .run(hashToken(token), userId, createdAt, expiresAt);
   response.setHeader('Set-Cookie', sessionCookie(token, expiresAt, isTls));
-  json(response, 200, { user: getPublicUser(database, user.id) });
+  return getPublicUser(database, userId);
 }
 
 async function createContactInvite(request, response, database, user) {
