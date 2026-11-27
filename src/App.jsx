@@ -33,7 +33,9 @@ import {
   getCountsByWord,
   deleteLastRecording,
   clearAllRecordings,
-  extractRelativeHandLandmarks
+  FRAMES_PER_SAMPLE,
+  FEATURES_PER_FRAME,
+  SCHEMA_VERSION
 } from './utils/db';
 import { loadModelAssets, predictSign } from './utils/signModel';
 import {
@@ -55,6 +57,10 @@ export const HAND_BOX_LINE_WIDTH = 2; // px: thickness of hand bounding box
 export const HAND_BOX_LABEL_FONT_SIZE = 12; // px: font size of hand box label
 export const HUD_PROGRESS_BAR_HEIGHT = 4; // px: height of HUD progress bars
 const ACCEPT_CONFIDENCE = 0.5;
+// Recording gesture window: same rules as live recognition
+const CAPTURE_MAX_MS = 3000; // stop after 3 s
+const CAPTURE_END_SILENCE_MS = 600; // stop when the hand has been gone this long
+const CAPTURE_MIN_HAND_FRAMES = 8; // fewer hand frames than this is rejected
 
 // The 21 hand landmarks connection pairs defined by MediaPipe
 const HAND_CONNECTIONS = [
@@ -1201,7 +1207,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [currentSubtitle, sentenceBuilder]);
+  }, [currentSubtitle, sentenceBuilder, hasTrailingSpace]);
 
   // 13. Recording Mode Handlers (Dataset Studio)
   const startRecordingFlow = () => {
@@ -1233,44 +1239,86 @@ export default function App() {
     setRecordedFramesCount(0);
 
     const capturedFrames = [];
+    let prevWrist = null;
+    let lastResult = null;
+    let handAbsentSince = null;
+    let finished = false;
+    const startedAt = performance.now();
 
-    recordIntervalRef.current = setInterval(async () => {
-      const latestResult = latestLandmarkerResultRef.current;
-      const frameData = extractRelativeHandLandmarks(latestResult);
-      capturedFrames.push(frameData);
-      setRecordedFramesCount(capturedFrames.length);
+    const finishCapture = async () => {
+      if (finished) return;
+      finished = true;
+      clearInterval(recordIntervalRef.current);
+      recordIntervalRef.current = null;
 
-      if (capturedFrames.length >= 30) {
-        if (recordIntervalRef.current) {
-          clearInterval(recordIntervalRef.current);
-          recordIntervalRef.current = null;
-        }
+      if (capturedFrames.length < CAPTURE_MIN_HAND_FRAMES) {
+        setRecordingState('idle');
+        setRecordedFramesCount(0);
+        showNotification(
+          `Only ${capturedFrames.length} hand frames captured. Keep your hand in view and sign again.`,
+          'error'
+        );
+        return;
+      }
 
-        setRecordingState('saving');
+      setRecordingState('saving');
+      try {
+        await saveRecording({
+          label: selectedWord,
+          frames: resampleFrames(capturedFrames, FRAMES_PER_SAMPLE),
+          timestamp: Date.now()
+        });
 
-        try {
-          await saveRecording({
-            label: selectedWord,
-            frames: capturedFrames.slice(0, 30),
-            timestamp: Date.now()
-          });
+        const updatedCounts = await getCountsByWord();
+        setWordCounts(updatedCounts);
 
-          const updatedCounts = await getCountsByWord();
-          setWordCounts(updatedCounts);
+        showNotification(
+          `Saved "${selectedWord}" sample #${updatedCounts[selectedWord]} (${updatedCounts[selectedWord]} / ${TARGET_SAMPLES_PER_WORD})`,
+          'success'
+        );
+      } catch (err) {
+        console.error('Error saving recording to IndexedDB:', err);
+        showNotification(`Failed to save recording: ${err.message}`, 'error');
+      } finally {
+        setRecordingState('idle');
+        setRecordedFramesCount(0);
+      }
+    };
 
-          showNotification(
-            `Saved "${selectedWord}" sample #${updatedCounts[selectedWord]} (${updatedCounts[selectedWord]} / ${TARGET_SAMPLES_PER_WORD})`,
-            'success'
-          );
-        } catch (err) {
-          console.error('Error saving recording to IndexedDB:', err);
-          showNotification(`Failed to save recording: ${err.message}`, 'error');
-        } finally {
-          setRecordingState('idle');
-          setRecordedFramesCount(0);
+    recordIntervalRef.current = setInterval(() => {
+      const now = performance.now();
+      const result = latestLandmarkerResultRef.current;
+
+      // Use each detection result once, the same way live recognition does
+      if (result && result !== lastResult) {
+        lastResult = result;
+        const { features, wristCoords, hasHand } = extractFrameFeatures(
+          result,
+          prevWrist,
+          handModeRef.current,
+          isMirroredRef.current
+        );
+
+        if (hasHand) {
+          capturedFrames.push(features);
+          prevWrist = wristCoords;
+          handAbsentSince = null;
+          setRecordedFramesCount(capturedFrames.length);
+        } else if (handAbsentSince === null) {
+          handAbsentSince = now;
         }
       }
-    }, 66);
+
+      const handGoneLongEnough =
+        capturedFrames.length > 0 &&
+        handAbsentSince !== null &&
+        now - handAbsentSince >= CAPTURE_END_SILENCE_MS;
+      const timedOut = now - startedAt >= CAPTURE_MAX_MS;
+
+      if (handGoneLongEnough || timedOut) {
+        finishCapture();
+      }
+    }, 33);
   };
 
   const handleDeleteLastRecording = async () => {
@@ -1311,12 +1359,10 @@ export default function App() {
         vocabulary: VOCABULARY,
         samplesPerWord: wordCounts,
         schema: {
-          framesPerSample: 30,
-          pointsPerHand: 21,
-          valuesPerPoint: 3,
-          valuesPerHand: 63,
-          valuesPerFrame: 126,
-          totalValuesPerSample: 3780
+          schemaVersion: SCHEMA_VERSION,
+          framesPerSample: FRAMES_PER_SAMPLE,
+          featuresPerFrame: FEATURES_PER_FRAME,
+          description: 'Same feature pipeline as live recognition (src/utils/features.js)'
         },
         recordings: allRecordings
       };
@@ -1396,9 +1442,10 @@ export default function App() {
         vocabulary: VOCABULARY,
         countsPerWord: wordCounts,
         schema: {
-          framesPerSample: 32,
-          featuresPerFrame: 138,
-          description: '32 frames x 138 hand features extracted via SignSpeak pipeline'
+          schemaVersion: SCHEMA_VERSION,
+          framesPerSample: FRAMES_PER_SAMPLE,
+          featuresPerFrame: FEATURES_PER_FRAME,
+          description: 'Same feature pipeline as live recognition (src/utils/features.js)'
         },
         samples: allRecordings
       };
@@ -1780,7 +1827,7 @@ export default function App() {
           {recordingState === 'recording' && (
             <div className="absolute top-4 right-16 z-20 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-rose-950/90 border border-rose-500 text-xs font-bold text-rose-300 shadow-xl shadow-rose-950/50 animate-pulse font-mono">
               <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-ping" />
-              <span>RECORDING: {recordedFramesCount} / 30 FRAMES</span>
+              <span>RECORDING: {recordedFramesCount} HAND FRAMES</span>
             </div>
           )}
 
@@ -1862,7 +1909,7 @@ export default function App() {
                     recordingState === 'countdown' ? (
                       `Get ready to sign "${selectedWord}" in ${countdown}...`
                     ) : recordingState === 'recording' ? (
-                      `Recording "${selectedWord}"... (${recordedFramesCount} / 30 frames)`
+                      `Recording "${selectedWord}"... (${recordedFramesCount} hand frames)`
                     ) : recordingState === 'saving' ? (
                       `Saving "${selectedWord}" to IndexedDB...`
                     ) : (
@@ -2291,7 +2338,7 @@ export default function App() {
                   {recordingState === 'countdown'
                     ? `Countdown: ${countdown}`
                     : recordingState === 'recording'
-                    ? `Recording ${recordedFramesCount}/30...`
+                    ? `Recording ${recordedFramesCount} frames...`
                     : recordingState === 'saving'
                     ? 'Saving to DB...'
                     : `Record "${selectedWord}"`}
